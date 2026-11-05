@@ -586,5 +586,7 @@ impl SubnetTreeRS {
 fn pysubnettree_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SubnetTreeRS>()?;
     m.add("FORMAT_VERSION", format::VERSION)?;
+    // lets benchmarks refuse unoptimized builds
+    m.add("_DEBUG_BUILD", cfg!(debug_assertions))?;
     Ok(())
 }

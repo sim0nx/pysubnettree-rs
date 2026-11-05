@@ -9,6 +9,7 @@ _D = TypeVar('_D')
 _N = TypeVar('_N', bound=Network)
 
 FORMAT_VERSION: Final[int]
+_DEBUG_BUILD: Final[bool]
 
 class Stats(TypedDict):
     ipv4_networks: int

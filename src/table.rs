@@ -2,34 +2,45 @@
 //!
 //! # Design
 //!
-//! The table keeps all prefixes in a sorted, struct-of-arrays list (`addrs`, `lens`, `vals`).
-//! Mutations are buffered in a small hash map (`pending`) and merged into the sorted list on the
-//! next lookup ("compile"). Compiling also flattens the (nested) prefixes into a list of disjoint
-//! address intervals: `starts[i]..starts[i + 1]` is matched by the entry `ids[i]`. A lookup is a
-//! binary search over `starts`, narrowed down by a direct index over the 16 most significant
-//! address bits.
+//! The table keeps all prefixes in a sorted, struct-of-arrays list (`addrs`, `lens`, `vals`,
+//! `parents`). Mutations are buffered in a hash map (`pending`) and merged into the sorted list
+//! on the next lookup ("compile"). Compiling also flattens the nested prefixes into disjoint
+//! address intervals that carry the matching **value id** inline: `starts[i]..starts[i + 1]` has
+//! the value `ivals[i]`. Adjacent intervals with the same value merge, which typically removes
+//! more than half of them. A value lookup is a binary search over `starts`, narrowed by an
+//! [`Index`].
 //!
-//! This layout needs ~21 bytes per IPv4 prefix (~33 bytes for IPv6) and no pointers, which keeps
-//! it compact and cache friendly. It is optimized for the "bulk load, then query" usage pattern:
-//! interleaving single inserts with lookups recompiles the table every time (`O(n)`).
+//! Lookups that need the matched *network* (`lookup`, `lookup_network`, `matches`) use the
+//! sorted entries instead: the longest prefix containing an address is on the parent chain of
+//! the last entry starting at or before it.
+//!
+//! The choice of this structure, and of the index parameters per address family, is based on
+//! the benchmarks in `docs/algorithms.md`. It is optimized for the "bulk load, then query" usage
+//! pattern: interleaving single inserts with lookups recompiles the table every time (`O(n)`).
 
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 
-/// Marker for "no entry" in `ids` and `parents`.
+/// Marker for "no entry" / "no value" in `parents` and `ivals`.
 pub const NO_ENTRY: u32 = u32::MAX;
 
-/// Number of most significant address bits used for the direct lookup index.
-const INDEX_BITS: u32 = 16;
-/// Tables with fewer intervals than this are searched without the index.
+/// Bits of the first index level.
+const INDEX_L1: u32 = 16;
+/// Tables with fewer intervals than this are searched without an index.
 const INDEX_MIN_INTERVALS: usize = 256;
+/// First-level buckets with more intervals than this get a second level (if enabled).
+const INDEX_CROWDED: u32 = 16;
 
 /// An address of one family, as an unsigned integer in host byte order.
 pub trait Addr: Copy + Ord + Eq + Hash + Debug + Default + Send + Sync + 'static {
     /// Number of bits of the address.
     const BITS: u8;
     const ZERO: Self;
+    /// Index the bits after the leading bits all prefixes share (instead of the top bits).
+    const INDEX_ADAPTIVE: bool;
+    /// Bits of the second index level, 0 for none.
+    const INDEX_L2: u32;
 
     /// Clears all bits after the first `len` bits.
     #[must_use]
@@ -39,9 +50,13 @@ pub trait Addr: Copy + Ord + Eq + Hash + Debug + Default + Send + Sync + 'static
     fn broadcast(self, len: u8) -> Self;
     #[must_use]
     fn checked_inc(self) -> Option<Self>;
-    /// The [`INDEX_BITS`] most significant bits.
+    /// `len` (`<= 32`) bits starting at bit `start`, counted from the most significant bit.
     #[must_use]
-    fn index_bucket(self) -> usize;
+    fn index_slice(self, start: u32, len: u32) -> usize;
+    /// Index bucket relative to `region`: `0` below it, `1 + ((self - region) >> shift)` inside,
+    /// saturating at `n + 1` above it. Branch free.
+    #[must_use]
+    fn index_bucket(self, region: Self, shift: u32, n: usize) -> usize;
     #[must_use]
     fn to_u128(self) -> u128;
     /// Inverse of [`Addr::to_u128`], `None` if out of range.
@@ -50,10 +65,12 @@ pub trait Addr: Copy + Ord + Eq + Hash + Debug + Default + Send + Sync + 'static
 }
 
 macro_rules! impl_addr {
-    ($t:ty) => {
+    ($t:ty, $adaptive:expr, $l2:expr) => {
         impl Addr for $t {
             const BITS: u8 = <$t>::BITS as u8;
             const ZERO: Self = 0;
+            const INDEX_ADAPTIVE: bool = $adaptive;
+            const INDEX_L2: u32 = $l2;
 
             #[inline]
             fn network(self, len: u8) -> Self {
@@ -70,9 +87,17 @@ macro_rules! impl_addr {
                 self.checked_add(1)
             }
 
-            #[inline]
-            fn index_bucket(self) -> usize {
-                (self >> (<$t>::BITS - INDEX_BITS)) as usize
+            #[inline(always)]
+            fn index_slice(self, start: u32, len: u32) -> usize {
+                if len == 0 { 0 } else { ((self << start) >> (<$t>::BITS - len)) as usize }
+            }
+
+            #[inline(always)]
+            fn index_bucket(self, region: Self, shift: u32, n: usize) -> usize {
+                let below = self < region;
+                let q = self.wrapping_sub(region) >> shift;
+                let inside = if q > n as $t { n } else { q as usize } + 1;
+                if below { 0 } else { inside }
             }
 
             #[inline]
@@ -88,11 +113,116 @@ macro_rules! impl_addr {
     };
 }
 
-impl_addr!(u32);
-impl_addr!(u128);
+// IPv4: plain index over the top 16 bits. IPv6: prefixes share their leading bits (2000::/4)
+// and cluster in a few /16s, so index the bits after the common prefix, with a second level.
+impl_addr!(u32, false, 0);
+impl_addr!(u128, true, 8);
 
 /// A prefix key: network address (host bits cleared) and prefix length.
 pub type Key<A> = (A, u8);
+
+/// Direct index into the interval starts.
+///
+/// The `INDEX_L1` bits after `offset` leading bits select a bucket inside the `region`
+/// (the network of length `offset` shared by all prefixes); addresses below and above the
+/// region are two extra buckets. Crowded buckets optionally get a second level of
+/// `A::INDEX_L2` bits.
+#[derive(Debug, Clone)]
+struct Index<A: Addr> {
+    offset: u32,
+    region: A,
+    /// Bucket `k` covers `starts[bounds[k]..bounds[k + 1]]`.
+    bounds: Box<[u32]>,
+    /// Second level block of a bucket (offset into `l2`), or [`NO_ENTRY`].
+    l2_block: Box<[u32]>,
+    l2: Box<[u32]>,
+}
+
+impl<A: Addr> Index<A> {
+    fn build(starts: &[A], addrs: &[A], lens: &[u8]) -> Self {
+        let l2_bits = A::INDEX_L2;
+        let bits = u32::from(A::BITS);
+        let mut offset = 0;
+        let mut region = A::ZERO;
+        if A::INDEX_ADAPTIVE {
+            // leading bits shared by all non-default prefixes
+            let mut iter = addrs.iter().zip(lens).filter(|&(_, &l)| l > 0);
+            if let Some((&first, &first_len)) = iter.next() {
+                let mut common = u32::from(first_len);
+                for (&a, &l) in iter {
+                    let diff = (a.to_u128() ^ first.to_u128()) << (128 - bits);
+                    common = common.min(diff.leading_zeros()).min(u32::from(l));
+                }
+                offset = common.min(bits - INDEX_L1 - l2_bits);
+                region = first.network(offset as u8);
+            }
+        }
+        let first_at_or_after = |addr: Option<A>| -> u32 {
+            let pos = addr.map_or(starts.len(), |a| starts.partition_point(|&s| s < a));
+            u32::try_from(pos).expect("too many intervals")
+        };
+        let region_end = region.broadcast(offset as u8).checked_inc();
+        // first address of the region's slot `slot` with `width` index bits
+        let slot_start = |width: u32, slot: u128| -> Option<A> {
+            if slot >> width != 0 {
+                return region_end;
+            }
+            A::from_u128(region.to_u128() | (slot << (bits - offset - width)))
+        };
+        let slots = 1u128 << INDEX_L1;
+        let mut bounds = Vec::with_capacity(slots as usize + 3);
+        bounds.push(0);
+        for b in 0..=slots {
+            bounds.push(first_at_or_after(slot_start(INDEX_L1, b)));
+        }
+        bounds.push(u32::try_from(starts.len()).expect("too many intervals"));
+
+        let mut l2_block = Vec::new();
+        let mut l2 = Vec::new();
+        if l2_bits > 0 {
+            l2_block = vec![NO_ENTRY; bounds.len() - 1];
+            let shift = bits - offset - INDEX_L1 - l2_bits;
+            for b in 0..slots {
+                let k = 1 + b as usize;
+                let (lo, hi) = (bounds[k], bounds[k + 1]);
+                if hi - lo <= INDEX_CROWDED {
+                    continue;
+                }
+                l2_block[k] = u32::try_from(l2.len()).expect("index size");
+                let base = slot_start(INDEX_L1, b).expect("inside the region").to_u128();
+                for c in 0..=1u128 << l2_bits {
+                    let addr =
+                        if c >> l2_bits == 0 { A::from_u128(base | (c << shift)) } else { slot_start(INDEX_L1, b + 1) };
+                    l2.push(first_at_or_after(addr).clamp(lo, hi));
+                }
+            }
+        }
+        Self { offset, region, bounds: bounds.into(), l2_block: l2_block.into(), l2: l2.into() }
+    }
+
+    /// Range of interval starts to search for `addr`.
+    #[inline(always)]
+    fn range(&self, addr: A) -> (usize, usize) {
+        let k = if A::INDEX_ADAPTIVE {
+            addr.index_bucket(self.region, u32::from(A::BITS) - self.offset - INDEX_L1, 1 << INDEX_L1)
+        } else {
+            // the region is the whole address space: no buckets below/above it
+            1 + addr.index_slice(0, INDEX_L1)
+        };
+        if A::INDEX_L2 > 0 {
+            let block = self.l2_block[k];
+            if block != NO_ENTRY {
+                let c = block as usize + addr.index_slice(self.offset + INDEX_L1, A::INDEX_L2);
+                return (self.l2[c] as usize, self.l2[c + 1] as usize);
+            }
+        }
+        (self.bounds[k] as usize, self.bounds[k + 1] as usize)
+    }
+
+    fn memory_usage(&self) -> usize {
+        (self.bounds.len() + self.l2_block.len() + self.l2.len()) * 4
+    }
+}
 
 /// Longest-prefix-match table for one address family.
 #[derive(Debug, Default, Clone)]
@@ -105,10 +235,9 @@ pub struct PrefixTable<A: Addr> {
     parents: Vec<u32>,
     /// Interval starts, `starts[0] == 0`, strictly increasing.
     starts: Vec<A>,
-    /// Entry matching `starts[i]..starts[i + 1]`, or [`NO_ENTRY`].
-    ids: Vec<u32>,
-    /// `index[b]` is the position of the first interval start whose top bits are `>= b`.
-    index: Option<Box<[u32]>>,
+    /// Value id of `starts[i]..starts[i + 1]`, or [`NO_ENTRY`]; neighbours always differ.
+    ivals: Vec<u32>,
+    index: Option<Index<A>>,
     /// Buffered mutations: `Some(value)` = insert/replace, `None` = remove.
     pending: HashMap<Key<A>, Option<u32>>,
     /// Number of prefixes including pending mutations.
@@ -145,6 +274,9 @@ impl<A: Addr> PrefixTable<A> {
             t.lens.push(len);
             t.vals.push(val);
         }
+        t.addrs.shrink_to_fit();
+        t.lens.shrink_to_fit();
+        t.vals.shrink_to_fit();
         t.len = t.addrs.len();
         t.compile();
         Ok(t)
@@ -273,17 +405,21 @@ impl<A: Addr> PrefixTable<A> {
         debug_assert_eq!(self.addrs.len(), self.len);
     }
 
-    /// Flattens the sorted prefixes into disjoint intervals and computes parents.
+    /// Flattens the sorted prefixes into disjoint intervals with inline value ids, computes
+    /// parents and builds the index.
     fn build_intervals(&mut self) {
         let n = self.addrs.len();
         let mut starts: Vec<A> = Vec::with_capacity(n + 1);
-        let mut ids: Vec<u32> = Vec::with_capacity(n + 1);
+        let mut ivals: Vec<u32> = Vec::with_capacity(n + 1);
         let mut parents = vec![NO_ENTRY; n];
+        let vals = &self.vals;
 
+        // `id` is an entry index (or NO_ENTRY), the interval stores its value id
         let mut push = |start: A, id: u32| {
-            if ids.last() != Some(&id) {
+            let val = if id == NO_ENTRY { NO_ENTRY } else { vals[id as usize] };
+            if ivals.last() != Some(&val) {
                 starts.push(start);
-                ids.push(id);
+                ivals.push(val);
             }
         };
 
@@ -325,31 +461,47 @@ impl<A: Addr> PrefixTable<A> {
         }
 
         starts.shrink_to_fit();
-        ids.shrink_to_fit();
-        self.index = (starts.len() >= INDEX_MIN_INTERVALS).then(|| build_index(&starts));
+        ivals.shrink_to_fit();
+        self.index = (starts.len() >= INDEX_MIN_INTERVALS).then(|| Index::build(&starts, &self.addrs, &self.lens));
         self.starts = starts;
-        self.ids = ids;
+        self.ivals = ivals;
         self.parents = parents;
     }
 
-    /// Longest prefix match of an address. Returns the entry index.
+    /// Value id of the longest prefix matching an address: the fast path, it only touches the
+    /// intervals.
     ///
     /// The table must be compiled.
     #[inline]
     #[must_use]
+    pub fn lookup_value(&self, addr: A) -> Option<u32> {
+        debug_assert!(!self.is_dirty());
+        let (lo, hi) = self.index.as_ref().map_or((0, self.starts.len()), |index| index.range(addr));
+        // starts[0] == 0 <= addr and every bucket's predecessor exists, therefore pos >= 1
+        let pos = lo + self.starts[lo..hi].partition_point(|&s| s <= addr);
+        let val = self.ivals[pos - 1];
+        (val != NO_ENTRY).then_some(val)
+    }
+
+    /// Longest prefix match of an address. Returns the entry index.
+    ///
+    /// The longest prefix containing `addr` is on the parent chain of the last entry starting at
+    /// or before `addr`. The table must be compiled.
+    #[must_use]
     pub fn lookup(&self, addr: A) -> Option<u32> {
         debug_assert!(!self.is_dirty());
-        let pos = if let Some(index) = &self.index {
-            let b = addr.index_bucket();
-            let lo = index[b] as usize;
-            let hi = index[b + 1] as usize;
-            lo + self.starts[lo..hi].partition_point(|&s| s <= addr)
-        } else {
-            self.starts.partition_point(|&s| s <= addr)
-        };
-        // starts[0] == 0 <= addr, therefore pos >= 1
-        let id = self.ids[pos - 1];
-        (id != NO_ENTRY).then_some(id)
+        let pos = self.addrs.partition_point(|&a| a <= addr);
+        let mut id = u32::try_from(pos.checked_sub(1)?).expect("too many prefixes");
+        loop {
+            let i = id as usize;
+            if self.addrs[i].broadcast(self.lens[i]) >= addr {
+                return Some(id);
+            }
+            id = self.parents[i];
+            if id == NO_ENTRY {
+                return None;
+            }
+        }
     }
 
     /// Longest prefix containing the whole network `addr/len`. Returns the entry index.
@@ -385,13 +537,6 @@ impl<A: Addr> PrefixTable<A> {
         (self.addrs[i], self.lens[i], self.vals[i])
     }
 
-    /// Value id of an entry index returned by a lookup (touches less memory than [`Self::entry`]).
-    #[inline]
-    #[must_use]
-    pub fn value_id(&self, id: u32) -> u32 {
-        self.vals[id as usize]
-    }
-
     /// Iterates the compiled entries `(addr, len, value id)` in sorted order.
     pub fn entries(&self) -> impl ExactSizeIterator<Item = (A, u8, u32)> + '_ {
         debug_assert!(!self.is_dirty());
@@ -403,10 +548,14 @@ impl<A: Addr> PrefixTable<A> {
         self.vals.iter().copied().chain(self.pending.values().filter_map(|&v| v))
     }
 
-    /// Rewrites all value ids, `remap[old] = new`. The table must be compiled.
+    /// Rewrites all value ids, `remap[old] = new` (an injective mapping). The table must be
+    /// compiled.
     pub fn remap_values(&mut self, remap: &[u32]) {
         debug_assert!(!self.is_dirty());
         for v in &mut self.vals {
+            *v = remap[*v as usize];
+        }
+        for v in self.ivals.iter_mut().filter(|v| **v != NO_ENTRY) {
             *v = remap[*v as usize];
         }
     }
@@ -426,24 +575,10 @@ impl<A: Addr> PrefixTable<A> {
             + self.vals.capacity() * 4
             + self.parents.capacity() * 4
             + self.starts.capacity() * a
-            + self.ids.capacity() * 4
-            + self.index.as_ref().map_or(0, |i| i.len() * 4)
+            + self.ivals.capacity() * 4
+            + self.index.as_ref().map_or(0, Index::memory_usage)
             + self.pending.capacity() * (size_of::<(Key<A>, Option<u32>)>() + 1)
     }
-}
-
-fn build_index<A: Addr>(starts: &[A]) -> Box<[u32]> {
-    let buckets = 1usize << INDEX_BITS;
-    let mut index = vec![0u32; buckets + 1];
-    let mut pos = 0usize;
-    for (b, slot) in index.iter_mut().enumerate() {
-        while pos < starts.len() && starts[pos].index_bucket() < b {
-            pos += 1;
-        }
-        *slot = u32::try_from(pos).expect("too many intervals");
-    }
-    index[buckets] = u32::try_from(starts.len()).expect("too many intervals");
-    index.into_boxed_slice()
 }
 
 #[cfg(test)]
@@ -465,8 +600,11 @@ mod tests {
         prefixes.iter().filter(|((a, l), _)| addr.network(*l) == *a).max_by_key(|((_, l), _)| *l).map(|(_, v)| *v)
     }
 
-    fn lookup_val(t: &PrefixTable<u32>, addr: u32) -> Option<u32> {
-        t.lookup(addr).map(|id| t.entry(id).2)
+    /// Value of the longest match, via both lookup paths (entries + parents, and intervals).
+    fn lookup_val<A: Addr>(t: &PrefixTable<A>, addr: A) -> Option<u32> {
+        let via_entry = t.lookup(addr).map(|id| t.entry(id).2);
+        assert_eq!(via_entry, t.lookup_value(addr), "lookup paths disagree for {addr:?}");
+        via_entry
     }
 
     #[test]
@@ -620,6 +758,53 @@ mod tests {
             let mut expected: Vec<_> = reference.keys().copied().collect();
             expected.sort_unstable();
             assert_eq!(entries, expected);
+        }
+    }
+
+    /// IPv6 with clustered prefixes: exercises the adaptive offset, the second index level and
+    /// addresses below/above the indexed region.
+    #[test]
+    fn randomized_ipv6_index() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for round in 0..20 {
+            let mut t = PrefixTable::<u128>::new();
+            let mut reference: HashMap<Key<u128>, u32> = HashMap::new();
+            let base = 0x2001_0db8u128 << 96;
+            for i in 0..3000u32 {
+                // dense in a few /48s so that buckets get crowded
+                let addr = base | (u128::from(rng.next() % 8) << 80) | (u128::from(rng.next()) << 16);
+                let len = 32 + (rng.next() % 97) as u8;
+                let key = (addr.network(len), len);
+                assert_eq!(t.insert(key, i), reference.insert(key, i));
+            }
+            if round % 2 == 0 {
+                t.insert((0, 0), 99_999); // default route: matches outside the region too
+                reference.insert((0, 0), 99_999);
+            }
+            t.compile();
+            let index = t.index.as_ref().expect("indexed");
+            assert_eq!(index.offset, 32, "the common 2001:db8::/32 is skipped");
+            assert!(!index.l2.is_empty(), "crowded buckets have a second level");
+            let prefixes: Vec<_> = reference.iter().map(|(&k, &v)| (k, v)).collect();
+            let naive6 = |addr: u128| {
+                prefixes
+                    .iter()
+                    .filter(|((a, l), _)| addr.network(*l) == *a)
+                    .max_by_key(|((_, l), _)| *l)
+                    .map(|(_, v)| *v)
+            };
+            for _ in 0..3000 {
+                let addr = match rng.next() % 4 {
+                    0 => u128::from(rng.next()) << 64 | u128::from(rng.next()),
+                    1 => base - 1 - u128::from(rng.next()),
+                    _ => {
+                        let ((a, l), _) = prefixes[(rng.next() as usize) % prefixes.len()];
+                        let b = a.broadcast(l);
+                        [a, b, a.wrapping_sub(1), b.wrapping_add(1)][(rng.next() % 4) as usize]
+                    }
+                };
+                assert_eq!(lookup_val(&t, addr), naive6(addr), "addr {addr:#x}");
+            }
         }
     }
 

@@ -1,4 +1,4 @@
-/target
+target/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -71,7 +71,7 @@ docs/_build/
 # Pyenv
 .python-version
 # Rust / maturin
-/target
+target/
 *.pyd
 
 # zensical

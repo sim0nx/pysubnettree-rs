@@ -1,0 +1,20 @@
+[package]
+name = "lpm-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Research: longest-prefix-match algorithms benchmarked on the sample data"
+license = "Apache-2.0"
+
+# standalone, not a member of the main crate's workspace
+[workspace]
+
+[dependencies]
+pysubnettree-rs = { path = "../..", default-features = false }
+# third-party Poptrie, only to cross-check our prototype (not used by the library)
+poptrie = "0.2.1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = false

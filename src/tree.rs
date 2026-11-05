@@ -350,8 +350,8 @@ impl<P> Tree<P> {
     #[must_use]
     pub fn lookup_value(&self, addr: Address) -> Option<&P> {
         let id = match addr {
-            Address::V4(a) => self.v4.value_id(self.v4.lookup(a)?),
-            Address::V6(a) => self.v6.value_id(self.v6.lookup(a)?),
+            Address::V4(a) => self.v4.lookup_value(a)?,
+            Address::V6(a) => self.v6.lookup_value(a)?,
         };
         Some(self.values.payload(id))
     }

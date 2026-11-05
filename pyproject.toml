@@ -62,6 +62,15 @@ python-source = "python"
 module-name = "pysubnettree_rs._pysubnettree_rs"
 features = ["python"]
 include = [{ path = "LICENSE", format = "sdist" }]
+# development only, never shipped (the wheel only contains python/pysubnettree_rs anyway)
+exclude = [
+  { path = "research/**/*", format = "sdist" },
+  { path = "benchmarks/**/*", format = "sdist" },
+  { path = "docs/**/*", format = "sdist" },
+  { path = "sample/**/*", format = "sdist" },
+  { path = "sample_configs/**/*", format = "sdist" },
+  { path = "scripts/**/*", format = "sdist" },
+]
 
 [tool.uv]
 # rebuild the extension when the Rust sources change
@@ -108,7 +117,7 @@ addopts = [
 branch = true
 
 [tool.codespell]
-skip = "*.lock,./target,./sample,./.venv,./site"
+skip = "*.lock,./target,./research/*/target,./sample,./.venv,./site"
 ignore-words-list = "asai"
 
 [tool.ruff]

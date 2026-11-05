@@ -9,27 +9,37 @@
 
 ## Data layout
 
-Each address family (IPv4 as `u32`, IPv6 as `u128`) has a `PrefixTable`:
+Each address family (IPv4 as `u32`, IPv6 as `u128`) has a `PrefixTable`. The structure and
+its parameters were chosen by benchmark; see [Lookup algorithms](algorithms.md).
 
 - **Entries**: networks sorted by `(address, prefix length)` in struct-of-arrays form: `addrs`,
   `lens`, `vals` (value ids), and `parents` (the enclosing network).
 - **Intervals**: the nested networks flattened into disjoint address ranges. `starts[i]` is the
-  first address of range `i`, and `ids[i]` is the entry that matches it, if any. Adjacent ranges
-  with the same entry are merged.
-- **Index**: for tables with at least 256 ranges, `index[b]` holds the first range whose top 16
-  address bits are `>= b`. This narrows the binary search to a handful of ranges.
+  first address of range `i`, and `ivals[i]` is the **value id** of the longest network
+  covering it, if any. Adjacent ranges with the same value merge. In a routing table, neighbouring
+  networks often have the same origin AS, so this removes more than half of the ranges.
+- **Index**, for tables with at least 256 ranges: a bucket number from 16 address bits
+  narrows the binary search to a few ranges.
+  - IPv4 uses the top 16 bits.
+  - IPv6 prefixes all start with the same bits (`2000::/4`) and cluster in a few `/16`s. The
+    IPv6 index therefore uses the 16 bits *after* the leading bits that all prefixes share, and
+    crowded buckets get a second 8-bit level. Addresses outside that region fall into two extra
+    buckets, so no unpredictable branch is needed.
 
-A lookup reads one index slot, binary-searches a short slice of `starts`, then reads `ids` and
-`vals`. That is roughly five memory accesses, independent of the table size.
+A value lookup (`get`, `[]`, `in`) reads the index, binary-searches a short slice of `starts`,
+and reads the value id. It does not touch the entries.
 
-Approximate memory per network:
+Lookups that return the matched network (`lookup`, `lookup_all`, network keys) use the entries.
+The longest network containing an address is the first one on the parent chain, starting from
+the last entry that begins at or before the address, that contains the address.
 
-| | IPv4 | IPv6 |
+Memory on the 2016 routeviews table:
+
+| | IPv4 (615,842 networks) | IPv6 (28,744 networks) |
 |---|---:|---:|
-| entries | 13 B | 25 B |
-| intervals (~1–2 per network) | 8–16 B | 20–40 B |
-
-The index adds a fixed 256 KiB per family.
+| entries and parents | 13 B per network | 25 B per network |
+| intervals | ~0.45 per network, 8 B each | ~1.1 per network, 20 B each |
+| index | 256 KiB | < 1 MiB (two levels) |
 
 ## Mutations
 

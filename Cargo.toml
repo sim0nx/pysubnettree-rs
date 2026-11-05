@@ -7,6 +7,22 @@ description = "Fast, memory-efficient longest-prefix-match lookups of IPv4/IPv6 
 license = "Apache-2.0"
 readme = "README.md"
 publish = false
+# development only: research, benchmarks, docs, sample data and tooling are not packaged
+exclude = [
+  "/research",
+  "/benchmarks",
+  "/docs",
+  "/sample",
+  "/sample_configs",
+  "/scripts",
+  "/site",
+  "/.github",
+  "/zensical.toml",
+  "/TODO.md",
+  "/AGENTS.md",
+  "/t.py",
+  "/tt.py",
+]
 
 [lib]
 name = "pysubnettree_rs"
