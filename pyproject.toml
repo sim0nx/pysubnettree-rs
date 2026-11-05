@@ -126,7 +126,7 @@ addopts = [
 branch = true
 
 [tool.codespell]
-skip = "*.lock,./target,./research/*/target,./sample,./.venv,./site"
+skip = "*.lock,./target,./research/*/target,./sample,./.venv,./site,./AGENTS.md"
 ignore-words-list = "asai"
 
 [tool.ruff]

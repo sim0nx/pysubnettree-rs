@@ -1,0 +1,153 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # build (and test) the distributions without publishing
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    name: Tag matches the package version
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compare tag and Cargo.toml version
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match the package version ${version}"
+            exit 1
+          fi
+
+  linux:
+    name: Wheels (${{ matrix.manylinux }}, ${{ matrix.target }})
+    runs-on: ${{ matrix.target == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+        manylinux: [auto, musllinux_1_2]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          # every interpreter in the build container, free-threaded ones included
+          args: --release --out dist --find-interpreter
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-linux-${{ matrix.manylinux }}-${{ matrix.target }}
+          path: dist/
+
+  macos:
+    name: Wheels (macOS universal2)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: |
+            3.11
+            3.12
+            3.13
+            3.14
+            3.14t
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: universal2-apple-darwin
+          args: --release --out dist --find-interpreter
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-macos
+          path: dist/
+
+  windows:
+    name: Wheels (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: |
+            3.11
+            3.12
+            3.13
+            3.14
+            3.14t
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --out dist --find-interpreter
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-windows
+          path: dist/
+
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: dist/
+
+  smoke-test:
+    name: Test the built wheels
+    needs: [linux]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.14', '3.14t']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        id: python
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheels-linux-auto-x86_64
+          path: dist/
+      - uses: astral-sh/setup-uv@v10
+      - name: Install the wheel and run the tests against it
+        run: |
+          uv venv --python '${{ steps.python.outputs.python-path }}' .venv-wheel
+          uv pip install --python .venv-wheel --no-index --find-links dist/ pysubnettree-rs
+          uv pip install --python .venv-wheel pytest hypothesis pydantic
+          # run from a directory without the source package, so the installed wheel is used
+          cd .github && ../.venv-wheel/bin/python -m pytest -q -p no:cacheprovider -o addopts='' ../tests
+
+  publish:
+    name: Upload to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check-version, linux, macos, windows, sdist, smoke-test]
+    runs-on: ubuntu-latest
+    permissions:
+      # IMPORTANT: this permission is mandatory for trusted publishing
+      id-token: write
+    environment:
+      name: release
+      url: https://pypi.org/p/pysubnettree-rs
+    steps:
+      # all artifacts of this run: the wheels and the sdist
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist/
+          merge-multiple: true
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

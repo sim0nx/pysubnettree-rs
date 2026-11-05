@@ -1,0 +1,133 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint (prek) and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            research/lpm-bench
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: '3.14'
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --group dev --group docs
+      - name: prek (ruff, mypy, codespell, rustfmt, clippy, ...)
+        # hooks that modify files (formatters, fixers) fail the run, so the diff is shown
+        run: uv run --no-sync prek run --all-files --show-diff-on-failure
+      - name: Research crate (rustfmt, clippy)
+        working-directory: research/lpm-bench
+        run: |
+          cargo fmt --check
+          cargo clippy --release --all-targets -- -D warnings
+      - name: Docs build
+        run: uv run --no-sync zensical build
+
+  tests:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ['3.11', '3.12', '3.13', '3.14', '3.15', '3.14t']
+        include:
+          - os: macos-latest
+            python-version: '3.14'
+          - os: windows-latest
+            python-version: '3.14'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v7
+        id: python
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - name: Build and install (debug build of the extension)
+        run: uv sync --group test --python '${{ steps.python.outputs.python-path }}'
+      - name: Free-threaded Python keeps the GIL disabled
+        if: endsWith(matrix.python-version, 't')
+        run: uv run --no-sync python -c "import sys, pysubnettree_rs; assert not sys._is_gil_enabled(), 'importing the extension enabled the GIL'"
+      - name: pytest
+        run: uv run --no-sync pytest -v
+      - name: Rust tests
+        # the pure Rust core does not depend on the Python version: once per OS
+        if: matrix.python-version == '3.14'
+        run: cargo test --no-default-features
+
+  research:
+    name: Lookup algorithm candidates (research/lpm-bench)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: research/lpm-bench
+      - name: All candidates match the reference implementation
+        working-directory: research/lpm-bench
+        run: cargo test --release
+
+  coverage:
+    name: Coverage (Rust + Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: '3.14'
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --group dev
+      - name: Coverage
+        # instrumented extension under pytest + cargo test, merged into coverage.lcov
+        run: ./scripts/coverage.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.lcov
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          files: coverage.lcov
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false

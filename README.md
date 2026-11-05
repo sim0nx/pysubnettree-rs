@@ -1,5 +1,8 @@
 # pysubnettree-rs
 
+[![Tests](https://github.com/sim0nx/pysubnettree-rs/actions/workflows/tests.yml/badge.svg)](https://github.com/sim0nx/pysubnettree-rs/actions/workflows/tests.yml)
+[![codecov](https://codecov.io/gh/sim0nx/pysubnettree-rs/graph/badge.svg)](https://codecov.io/gh/sim0nx/pysubnettree-rs)
+
 Fast, memory-efficient longest-prefix-match lookups of IPv4 and IPv6 subnets for Python,
 written in safe Rust (`#![forbid(unsafe_code)]`) using [PyO3](https://pyo3.rs).
 

@@ -5,6 +5,7 @@ default_language_version:
 
 exclude: |
   (?x)^(
+    AGENTS.md|
     sample/.*|
     target/.*|
     site/.*|
