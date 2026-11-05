@@ -5,7 +5,6 @@ build-backend = "maturin"
 [project]
 name = "pysubnettree-rs"
 description = "Fast, memory-efficient longest-prefix-match lookups of IPv4/IPv6 subnets, written in Rust"
-readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Georges Toth", email = "georges@trypill.org" }]
@@ -34,6 +33,16 @@ keywords = ["ip", "subnet", "cidr", "prefix", "longest-prefix-match", "trie", "r
 requires-python = ">= 3.11"
 dependencies = []
 dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/sim0nx/pysubnettree-rs"
+Documentation = "https://github.com/sim0nx/pysubnettree-rs"
+Source = "https://github.com/sim0nx/pysubnettree-rs"
+Tracker = "https://github.com/sim0nx/pysubnettree-rs/issues"
+
+[project.readme]
+file = "README.md"
+content-type = "text/markdown"
 
 [dependency-groups]
 dev = [

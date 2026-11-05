@@ -319,6 +319,18 @@ impl<P> Tree<P> {
         Ok(Tree { v4: self.v4, v6: self.v6, values: ValueStore::from_entries(entries), types: self.types })
     }
 
+    /// An independent copy; payloads are produced by `clone` (e.g. `Py::clone_ref`, Python
+    /// objects are not `Clone`). Used for copy-on-write.
+    #[must_use]
+    pub fn clone_with<Q>(&self, clone: impl FnMut(&P) -> Q) -> Tree<Q> {
+        Tree {
+            v4: self.v4.clone(),
+            v6: self.v6.clone(),
+            values: self.values.clone_with(clone),
+            types: self.types.clone(),
+        }
+    }
+
     /// Canonical encoding of a stored value.
     #[must_use]
     pub fn encoded(&self, id: u32) -> &Arc<[u8]> {
@@ -476,5 +488,17 @@ mod tests {
         assert_eq!(t.find_value(&encode(&Value::Int(99))), Some(0));
         t.insert_value(net("11.0.0.0/8"), Value::Int(99));
         assert_eq!(t.value_count(), 1);
+
+        // a copy is independent of the original, including pending mutations
+        let mut copy = t.clone_with(Value::clone);
+        copy.insert_value(net("12.0.0.0/8"), Value::Int(5));
+        copy.remove(net("10.0.0.0/8"));
+        let _ = copy.compile();
+        let _ = t.compile();
+        assert_eq!(t.len(), 2);
+        assert_eq!(copy.len(), 2);
+        assert_eq!(t.lookup_value(addr("10.0.0.1")), Some(&Value::Int(99)));
+        assert_eq!(copy.lookup_value(addr("10.0.0.1")), None);
+        assert_eq!(copy.lookup_value(addr("12.0.0.1")), Some(&Value::Int(5)));
     }
 }

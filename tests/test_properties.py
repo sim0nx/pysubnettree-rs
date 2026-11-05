@@ -6,7 +6,7 @@ import types
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from pysubnettree_rs import SubnetTreeRS
+from pysubnettree_rs import SubnetTreeBuilder, SubnetTreeRS
 
 
 def networks(version: int):
@@ -67,7 +67,7 @@ def addresses_near(nets):
     st.lists(st.one_of(networks(4), networks(6)), max_size=10),
 )
 def test_matches_reference(ops, probes):
-    tree = SubnetTreeRS()
+    tree = SubnetTreeBuilder()
     ref = Reference()
     for op, raw_net, value in ops:
         net = normalize(raw_net)
@@ -91,8 +91,10 @@ def test_matches_reference(ops, probes):
 
     assert list(tree) == [str(n) for n in sorted(ref.data, key=lambda n: (n.version, n.network_address, n.prefixlen))]
 
-    restored = SubnetTreeRS.from_bytes(tree.to_bytes())
-    assert restored.items() == tree.items()
+    built = tree.build()
+    assert built.items() == tree.items()
+    restored = SubnetTreeRS.from_bytes(built.to_bytes())
+    assert restored.items() == built.items()
 
 
 def frozen(value):
@@ -107,11 +109,11 @@ def frozen(value):
 @settings(max_examples=200, deadline=None)
 @given(values)
 def test_value_roundtrip(value):
-    tree = SubnetTreeRS()
+    tree = SubnetTreeBuilder()
     tree['192.0.2.0/24'] = value
     expected = frozen(value)
     assert tree['192.0.2.1'] == expected
-    assert SubnetTreeRS.from_bytes(tree.to_bytes())['192.0.2.1'] == expected
+    assert SubnetTreeRS.from_bytes(tree.build().to_bytes())['192.0.2.1'] == expected
 
 
 @settings(max_examples=200, deadline=None)

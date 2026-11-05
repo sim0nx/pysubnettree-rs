@@ -5,7 +5,7 @@ from typing import Any, assert_type
 
 import pydantic
 
-from pysubnettree_rs import SubnetTreeRS
+from pysubnettree_rs import SubnetTreeBuilder, SubnetTreeRS
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,11 +23,15 @@ class Owner(pydantic.BaseModel):
 
 
 def test_typed_dataclass_tree(tmp_path) -> None:
-    tree = SubnetTreeRS(value_type=Route)
+    builder = SubnetTreeBuilder(value_type=Route)
+    assert_type(builder, SubnetTreeBuilder[Route])
+    builder['10.0.0.0/8'] = Route(asn=64512, country='LU')
+    builder.insert('10.1.0.0/16')  # no value
+    builder.insert_many({'192.0.2.0/24': Route(asn=64496, tags=('doc',))})
+
+    tree = builder.build()  # immutable and lock-free
     assert_type(tree, SubnetTreeRS[Route])
-    tree['10.0.0.0/8'] = Route(asn=64512, country='LU')
-    tree.insert('10.1.0.0/16')  # no value
-    tree.insert_many({'192.0.2.0/24': Route(asn=64496, tags=('doc',))})
+    del builder  # frees the builder's copy
 
     route = tree['10.200.0.1']
     assert_type(route, Route | None)
@@ -42,17 +46,25 @@ def test_typed_dataclass_tree(tmp_path) -> None:
     assert_type(loaded, SubnetTreeRS[Route])
     assert loaded.items() == tree.items()
 
+    # modify a saved tree: load it as a builder (or use tree.to_builder())
+    editable = SubnetTreeBuilder.load(tmp_path / 'routes.pst', value_type=Route)
+    assert_type(editable, SubnetTreeBuilder[Route])
+    editable.remove('10.1.0.0/16')
+    assert len(editable.build()) == len(tree) - 1
+
 
 def test_typed_pydantic_tree() -> None:
-    tree: SubnetTreeRS[Owner] = SubnetTreeRS(Owner)
-    tree['2001:db8::/32'] = Owner(name='doc', asn=64496)
-    owner = tree['2001:db8::1']
+    builder: SubnetTreeBuilder[Owner] = SubnetTreeBuilder(Owner)
+    builder['2001:db8::/32'] = Owner(name='doc', asn=64496)
+    owner = builder.build()['2001:db8::1']
     assert owner is not None
     assert owner.name == 'doc'
 
 
 def test_untyped_tree() -> None:
-    tree = SubnetTreeRS()
+    builder = SubnetTreeBuilder()
+    assert_type(builder, SubnetTreeBuilder[Any])
+    builder['10.0.0.0/8'] = {'asn': 64512, 'tags': ['a']}
+    tree = builder.build()
     assert_type(tree, SubnetTreeRS[Any])
-    tree['10.0.0.0/8'] = {'asn': 64512, 'tags': ['a']}
     assert tree['10.0.0.1'] == {'asn': 64512, 'tags': ('a',)}  # read-only: mappingproxy and tuple

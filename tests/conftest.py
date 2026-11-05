@@ -4,7 +4,7 @@ import datetime as dt
 import pydantic
 import pytest
 
-from pysubnettree_rs import SubnetTreeRS
+from pysubnettree_rs import SubnetTreeBuilder, SubnetTreeRS
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -38,7 +38,8 @@ class Model(pydantic.BaseModel):
 
 @pytest.fixture
 def tree() -> SubnetTreeRS:
-    t = SubnetTreeRS()
+    """An immutable tree."""
+    t = SubnetTreeBuilder()
     t.insert_many(
         {
             '10.0.0.0/8': 'ten',
@@ -48,4 +49,4 @@ def tree() -> SubnetTreeRS:
             '2001:db8:1::/48': 48,
         },
     )
-    return t
+    return t.build()

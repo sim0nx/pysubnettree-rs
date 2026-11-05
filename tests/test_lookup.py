@@ -4,7 +4,7 @@ import ipaddress
 
 import pytest
 
-from pysubnettree_rs import SubnetTreeRS
+from pysubnettree_rs import SubnetTreeBuilder
 
 OFFICE = {'name': 'office', 'tags': ('a', 'b')}
 
@@ -64,13 +64,14 @@ def test_key_types(tree, key, expected):
     ],
 )
 def test_invalid_keys(tree, key, error):
-    for operation in (tree.get, tree.__contains__, tree.lookup, tree.insert, tree.has_network):
+    builder = tree.to_builder()
+    for operation in (tree.get, tree.__contains__, tree.lookup, tree.has_network, builder.get, builder.insert, builder.remove):
         with pytest.raises(error):
             operation(key)
 
 
 def test_edges_of_the_address_space():
-    t = SubnetTreeRS()
+    t = SubnetTreeBuilder()
     for net in ['0.0.0.0/0', '::/0', '255.255.255.255', 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff', '0.0.0.0/32']:
         t[net] = net
     assert t['0.0.0.0'] == '0.0.0.0/32'
@@ -78,7 +79,7 @@ def test_edges_of_the_address_space():
     assert t['255.255.255.255'] == '255.255.255.255'
     assert t['::'] == t['ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe'] == '::/0'
     assert t['ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'] == 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'
-    empty = SubnetTreeRS()
+    empty = SubnetTreeBuilder()
     assert len(empty) == 0
     assert not empty
     assert '1.2.3.4' not in empty
@@ -87,7 +88,7 @@ def test_edges_of_the_address_space():
 
 
 def test_mutations():
-    t = SubnetTreeRS()
+    t = SubnetTreeBuilder()
     assert t.insert('10.0.0.0/8', 1) is True
     assert t.insert('10.0.0.0/8', 2) is False
     assert t['10.0.0.1'] == 2
@@ -123,7 +124,7 @@ def test_mutations():
 
 
 def test_insert_many_and_interleaving():
-    t = SubnetTreeRS()
+    t = SubnetTreeBuilder()
     assert t.insert_many({'10.0.0.0/8': 1, '11.0.0.0/8': 2}) == 2
     assert t.insert_many([('10.0.0.0/8', 3), ('12.0.0.0/8', None)]) == 1
     # more than one internal chunk
@@ -138,7 +139,7 @@ def test_insert_many_and_interleaving():
             t.insert_many(bad)  # type: ignore[arg-type]
         assert len(t) == before, 'nothing is stored if a chunk fails'
     # lookups between single inserts see every insert (each lookup recompiles)
-    t = SubnetTreeRS()
+    t = SubnetTreeBuilder()
     for i in range(100):
         t[f'10.{i}.0.0/16'] = i
         assert t[f'10.{i}.1.1'] == i

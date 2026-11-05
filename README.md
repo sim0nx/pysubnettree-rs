@@ -7,14 +7,18 @@ Load a large collection of networks (for example a full BGP routing table), atta
 each one, and find the most specific network for any IP address. The loaded structure can be saved
 to a compact, checksummed file (XXH3-64) and loaded again quickly.
 
-```python
-from pysubnettree_rs import SubnetTreeRS
+Build a tree with `SubnetTreeBuilder`, then query the immutable `SubnetTreeRS`:
 
-tree = SubnetTreeRS()
-tree['10.0.0.0/8'] = {'name': 'private', 'asn': 64512}
-tree['10.1.0.0/16'] = {'name': 'office'}
-tree.insert('2001:db8::/32', 'documentation')
-tree.insert('192.0.2.0/24')  # no value: lookups return None
+```python
+from pysubnettree_rs import SubnetTreeBuilder, SubnetTreeRS
+
+builder = SubnetTreeBuilder()
+builder['10.0.0.0/8'] = {'name': 'private', 'asn': 64512}
+builder['10.1.0.0/16'] = {'name': 'office'}
+builder.insert('2001:db8::/32', 'documentation')
+builder.insert('192.0.2.0/24')  # no value: lookups return None
+tree = builder.build()          # immutable, lock-free copy
+del builder                     # frees the builder's memory
 
 tree['10.1.2.3']          # mappingproxy({'name': 'office'}), values are read-only
 tree['192.0.2.1']         # None (found, no value)
@@ -26,6 +30,9 @@ tree.dump('networks.pst')
 tree = SubnetTreeRS.load('networks.pst')
 ```
 
+The tree can't be modified, so it needs no locking and can be shared between threads freely.
+To change it, use `tree.to_builder()` or `SubnetTreeBuilder.load(path)` to get a modifiable copy.
+
 ### Typed values
 
 A tree can be restricted to one value type, such as a frozen dataclass or a frozen pydantic
@@ -34,7 +41,7 @@ model. Inserts are then checked at runtime, and type checkers see that type in e
 ```python
 from dataclasses import dataclass
 
-from pysubnettree_rs import SubnetTreeRS
+from pysubnettree_rs import SubnetTreeBuilder, SubnetTreeRS
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,12 +51,14 @@ class Route:
     tags: tuple[str, ...] = ()
 
 
-tree = SubnetTreeRS(value_type=Route)       # SubnetTreeRS[Route]
-tree['10.0.0.0/8'] = Route(asn=64512, country='LU')
-tree.insert('10.1.0.0/16')                  # no value
+builder = SubnetTreeBuilder(value_type=Route)   # SubnetTreeBuilder[Route]
+builder['10.0.0.0/8'] = Route(asn=64512, country='LU')
+builder.insert('10.1.0.0/16')                   # no value
+builder['192.0.2.0/24'] = {'asn': 1}            # mypy error, TypeError at runtime
+tree = builder.build()                          # SubnetTreeRS[Route]
 
-route = tree['10.200.0.1']                  # Route | None
-tree['192.0.2.0/24'] = {'asn': 1}           # mypy error, TypeError at runtime
+route = tree['10.200.0.1']                      # Route | None
+tree['10.0.0.0/8'] = Route(asn=1)               # mypy error, TypeError: the tree is immutable
 
 tree.dump('routes.pst')
 tree = SubnetTreeRS.load('routes.pst', value_type=Route)
@@ -67,32 +76,39 @@ tree = SubnetTreeRS.load('routes.pst', value_type=Route)
 - Values are read-only. Lookups return immutable objects: `list` and `tuple` come back as
   `tuple`, and `dict` as `types.MappingProxyType`. Equal values are stored once and returned as
   the same object, with no copying or conversion per lookup.
-- Optional value type, `SubnetTreeRS(value_type=Route)`, with generic typing
-  (`SubnetTreeRS[Route]`).
+- Optional value type, `SubnetTreeBuilder(value_type=Route)`, with generic typing
+  (`SubnetTreeBuilder[Route]` builds a `SubnetTreeRS[Route]`).
+- An immutable tree class for queries: no locks, safe to share between threads. On
+  free-threaded Python, lookups scale with the number of threads.
 - A compact binary on-disk format with an XXH3-64 checksum. Untrusted files are fully validated,
   and classes are never imported by name from a file.
-- Works with `pickle` and with free-threaded Python (3.14t); lookups run in parallel.
+- Works with `pickle` and with free-threaded Python (3.14t).
 - Releases the GIL while building the lookup structure and during file I/O.
 
 ## API
 
-| Method | Description |
-|---|---|
-| `SubnetTreeRS(value_type=None)` | Create an empty tree, optionally restricted to one value type. |
-| `insert(network, value=None)` / `tree[network] = value` | Add or replace a network. Host bits are ignored. |
-| `insert_many(mapping_or_pairs)` | Bulk insert, faster than repeated `insert`. |
-| `tree[key]` | Value of the longest match, `KeyError` if there is none. |
-| `get(key, default=None)` | Value of the longest match, or `default`. |
-| `lookup(key)` | `(network, value)` of the longest match, or `None`. |
-| `lookup_all(key)` | All matching `(network, value)` pairs, most specific first. |
-| `key in tree` | True if any network matches. |
-| `has_network(network)` / `get_exact(network, default=None)` | Exact network match. |
-| `remove(network)` / `del tree[network]` | Remove a network. |
-| `len(tree)`, `iter(tree)`, `items()`, `clear()` | Container protocol. |
-| `compile()` | Build the lookup structure now instead of on the first lookup. |
-| `to_bytes()` / `SubnetTreeRS.from_bytes(data, value_type=None, types=())` | Serialize to and from `bytes`. |
-| `dump(path)` / `SubnetTreeRS.load(path, value_type=None, types=())` | Save to and load from a file (writes atomically). |
-| `stats()`, `memory_usage()` | Sizes and approximate memory use. |
+`SubnetTreeRS` (immutable, for queries) and `SubnetTreeBuilder` (modifiable) share the read
+methods. Lookups on the builder are a convenience: they take a lock and compile pending changes
+first.
+
+| Method | `SubnetTreeRS` | `SubnetTreeBuilder` | Description |
+|---|:-:|:-:|---|
+| `SubnetTreeBuilder(value_type=None)` | | ✓ | Create an empty builder, optionally restricted to one value type. |
+| `build()` | | ✓ | An immutable `SubnetTreeRS` with a copy of the contents. |
+| `to_builder()` | ✓ | | A modifiable copy. |
+| `insert(network, value=None)` / `b[network] = value` | | ✓ | Add or replace a network. Host bits are ignored. |
+| `insert_many(mapping_or_pairs)` | | ✓ | Bulk insert, faster than repeated `insert`. |
+| `remove(network)` / `del b[network]`, `clear()` | | ✓ | Remove networks. |
+| `t[key]` | ✓ | ✓ | Value of the longest match, `KeyError` if there is none. |
+| `get(key, default=None)` | ✓ | ✓ | Value of the longest match, or `default`. |
+| `lookup(key)` | ✓ | ✓ | `(network, value)` of the longest match, or `None`. |
+| `lookup_all(key)` | ✓ | ✓ | All matching `(network, value)` pairs, most specific first. |
+| `key in t` | ✓ | ✓ | True if any network matches. |
+| `has_network(network)` / `get_exact(network, default=None)` | ✓ | ✓ | Exact network match. |
+| `len(t)`, `iter(t)`, `items()` | ✓ | ✓ | Container protocol. |
+| `stats()`, `memory_usage()` | ✓ | ✓ | Sizes and approximate memory use. |
+| `to_bytes()` / `dump(path)` | ✓ | | Serialize to `bytes` or a file (written atomically). |
+| `from_bytes(data, value_type=None, types=())` / `load(path, ...)` | ✓ | ✓ | Deserialize, as an immutable tree or as a builder to modify it. |
 
 A lookup key can be an address or a network. For a network such as `'10.1.2.0/24'`, the result is
 the most specific stored network that contains the whole key network.
@@ -107,17 +123,17 @@ Full 2016 routeviews table, IPv4 and IPv6, with AS numbers as values. The table 
 reproduce it.
 
 <!-- bench:start -->
-AMD Ryzen 9 3900X 12-Core Processor, Python 3.14.5, pysubnettree-rs 0.1.0, pysubnettree 0.38.1; 1,000,000 lookups per set, median of 3 runs.
+AMD Ryzen 9 3900X 12-Core Processor, Python 3.14.5, pysubnettree-rs 0.1.0, pysubnettree 0.38.1; 1,000,000 lookups per set, median of 3 passes in each of 3 processes.
 
 | | pysubnettree-rs | [pysubnettree](https://github.com/zeek/pysubnettree) |
 |---|---:|---:|
-| Load 644,586 networks | 0.26 s | 0.32 s |
-| Lookup, addresses inside table networks | 168 ns | 1202 ns |
-| Lookup, random addresses | 122 ns | 762 ns |
-| of which Python loop and call overhead | 27 ns | 28 ns |
-| Memory (RSS increase) | 19 MB | 98 MB |
-| Save to file (size) | 0.010 s (4.1 MB) | n/a |
-| Load from file | 0.039 s | n/a |
+| Load 644,586 networks | 0.31 s | 0.35 s |
+| Lookup, addresses inside table networks | 195 ns | 1226 ns |
+| Lookup, random addresses | 132 ns | 800 ns |
+| of which Python loop and call overhead | 29 ns | 29 ns |
+| Memory (RSS increase) | 18 MB | 98 MB |
+| Save to file (size) | 0.012 s (4.1 MB) | n/a |
+| Load from file | 0.042 s | n/a |
 <!-- bench:end -->
 
 ### Compared to other algorithms
@@ -139,9 +155,10 @@ after the prefix all networks share (`2000::/4`) and has a second level. This wa
 benchmarking it against Tree Bitmap, Poptrie, DIR-24-8 and others; see
 [docs/algorithms.md](docs/algorithms.md).
 
-The structure is designed for "load in bulk, then query". Modifications are buffered and merged
-by the next lookup. Interleaving single inserts with lookups rebuilds the structure on every
-lookup, which costs `O(n)`. Insert everything first, then query.
+The structure is designed for "load in bulk, then query". A builder buffers modifications and
+merges them when it is built or queried. Interleaving single inserts with lookups on a builder
+rebuilds the structure on every lookup, which costs `O(n)`. Insert everything, call `build()`,
+then query the tree.
 
 ## Development
 

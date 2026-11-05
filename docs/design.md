@@ -43,10 +43,14 @@ Memory on the 2016 routeviews table:
 
 ## Mutations
 
-Inserts and removals go into a hash map of pending changes. Length tracking and exact queries
-(`has_network`, `get_exact`, `remove`) work without rebuilding. The next lookup merges the
-pending changes into the sorted entries and rebuilds the intervals in a single linear pass, using
-a stack of open networks.
+Only a `SubnetTreeBuilder` can be modified. Inserts and removals go into a hash map of pending
+changes. Length tracking and exact queries (`has_network`, `get_exact`, `remove`) work without
+rebuilding. The next lookup or `build()` merges the pending changes into the sorted entries and
+rebuilds the intervals in a single linear pass, using a stack of open networks.
+
+`build()` copies the compiled data into a `SubnetTreeRS`. Copying the value objects only
+increments their reference counts. Each object owns its data exclusively, which keeps memory
+management and garbage collection simple.
 
 ## Values
 
@@ -69,13 +73,19 @@ are unused.
 
 ## Concurrency
 
-On free-threaded Python, lookups scale from 4.8 M/s on one thread to 10.8 M/s on four (shared
-`RwLock` reader counter; a lock-free snapshot is a planned improvement).
+`SubnetTreeRS` has no interior mutability and no lock: it is compiled when created and never
+changes. pyo3 only accepts a frozen class whose contents are `Sync`, so sharing it between
+threads is safe by construction. On free-threaded Python, its lookups scale with the threads
+(see [Usage](usage.md#threads) for numbers).
 
+`SubnetTreeBuilder` wraps its data in a `RwLock`. Lookups take a read lock, and if changes are
+pending, upgrade to a write lock to compile first. The lock is never held while calling into
+Python, and never drops a Python object, because a `__del__` could re-enter the builder and
+deadlock. Keys and values are converted before the lock is taken, and results are converted
+after it is released. Payloads discarded by compaction or deduplication are dropped after the
+lock is released. The locks detach from the interpreter while blocking, so they cannot deadlock
+with the GIL.
 
-The Python class is `frozen` and wraps the tree in a `RwLock`. Lookups take a read lock, and if
-changes are pending, upgrade to a write lock to rebuild first. The lock is never held while
-calling into Python, and never drops a Python object, since a `__del__` could re-enter the tree.
-Values are converted before the lock is taken. Payloads that compaction or deduplication
-discard are returned and dropped after the lock is released. The locks detach from the interpreter while blocking, so they cannot deadlock with the
-GIL.
+Both classes report their Python references to the cycle garbage collector (`__traverse__`).
+The builder can also break cycles (`__clear__`). The tree is immutable and doesn't need to: every
+cycle through it passes a class object, which the collector clears.

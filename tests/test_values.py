@@ -10,7 +10,7 @@ import pydantic
 import pytest
 
 import pysubnettree_rs
-from pysubnettree_rs import SubnetTreeRS
+from pysubnettree_rs import SubnetTreeBuilder, SubnetTreeRS
 
 from .conftest import Geo, Model, Owner, Route
 
@@ -20,12 +20,15 @@ MODEL = Model(asn=15169, owner=Owner(name='Google', since=dt.date(2000, 1, 2)), 
 
 def roundtrips(value, value_type=None, types_=()):
     """Stores `value` and returns it as seen after insert, bytes, file-less pickle and copy."""
-    t = SubnetTreeRS(value_type) if value_type else SubnetTreeRS()
+    t = SubnetTreeBuilder(value_type) if value_type else SubnetTreeBuilder()
     t['192.0.2.0/24'] = value
-    data = t.to_bytes()
+    tree = t.build()
+    data = tree.to_bytes()
     return [
         t['192.0.2.1'],
+        tree['192.0.2.1'],
         SubnetTreeRS.from_bytes(data, value_type=value_type, types=types_)['192.0.2.1'],
+        pickle.loads(pickle.dumps(tree))['192.0.2.1'],  # noqa: S301
         pickle.loads(pickle.dumps(t))['192.0.2.1'],  # noqa: S301
     ]
 
@@ -53,7 +56,7 @@ def test_supported_values_roundtrip(value, expected):
 
 
 def test_values_are_read_only_and_shared():
-    t = SubnetTreeRS()
+    t = SubnetTreeBuilder()
     t['10.0.0.0/8'] = {'tags': ['a']}
     t['11.0.0.0/8'] = {'tags': ['a']}
     first = t['10.0.0.1']
@@ -80,9 +83,10 @@ def test_values_are_read_only_and_shared():
 
 
 def test_typed_tree():
-    t = SubnetTreeRS(value_type=Route)
+    t = SubnetTreeBuilder(value_type=Route)
     assert t.value_type is Route
-    assert repr(t) == 'SubnetTreeRS(ipv4_networks=0, ipv6_networks=0, value_type=Route)'
+    assert repr(t) == 'SubnetTreeBuilder(ipv4_networks=0, ipv6_networks=0, value_type=Route)'
+    assert repr(t.build()) == 'SubnetTreeRS(ipv4_networks=0, ipv6_networks=0, value_type=Route)'
     t['10.0.0.0/8'] = ROUTE
     t.insert('10.1.0.0/16')
     assert t['10.1.0.1'] is None
@@ -93,7 +97,7 @@ def test_typed_tree():
     # generic alias at runtime, as used in annotations
     assert SubnetTreeRS[Route] is not None
     # loading checks the value type
-    data = t.to_bytes()
+    data = t.build().to_bytes()
     assert SubnetTreeRS.load.__name__ == 'load'
     with pytest.raises(ValueError, match='types='):
         SubnetTreeRS.from_bytes(data)  # Route unknown
@@ -102,10 +106,10 @@ def test_typed_tree():
     assert SubnetTreeRS.from_bytes(data, value_type=Route, types=[Geo])['10.0.0.1'] == ROUTE
     with pytest.raises(ValueError, match='expected Geo'):
         SubnetTreeRS.from_bytes(data, value_type=Geo, types=[Route])
-    untyped = SubnetTreeRS()
+    untyped = SubnetTreeBuilder()
     untyped['10.0.0.0/8'] = 'not a route'
     with pytest.raises(ValueError, match='expected Route'):
-        SubnetTreeRS.from_bytes(untyped.to_bytes(), value_type=Route)
+        SubnetTreeRS.from_bytes(untyped.build().to_bytes(), value_type=Route)
 
 
 def test_unsupported_values():
@@ -125,7 +129,7 @@ def test_unsupported_values():
 
     for cls in (Mutable, NoInit, MutableModel):
         with pytest.raises(TypeError, match='frozen|init=False'):
-            SubnetTreeRS(value_type=cls)
+            SubnetTreeBuilder(value_type=cls)
     nested: list = []
     for _ in range(70):
         nested = [nested]
@@ -144,7 +148,7 @@ def test_unsupported_values():
         (nested, ValueError),
         (recursive, ValueError),
     ]:
-        t = SubnetTreeRS()
+        t = SubnetTreeBuilder()
         with pytest.raises(error):
             t['10.0.0.0/8'] = value
         assert len(t) == 0
@@ -152,7 +156,7 @@ def test_unsupported_values():
     class Shade(enum.IntEnum):
         DARK = 1
 
-    t = SubnetTreeRS()
+    t = SubnetTreeBuilder()
     t['10.0.0.0/8'] = Shade.DARK  # int subclasses are stored as int
     assert type(t['10.0.0.1']) is int
     # two different classes with the same qualified name can not be mixed in one tree
@@ -177,7 +181,7 @@ def test_insert_many_reuses_objects():
             return super().model_dump(**kwargs)
 
     shared = Counted(asn=1)
-    t = SubnetTreeRS(value_type=Counted)
+    t = SubnetTreeBuilder(value_type=Counted)
     assert t.insert_many((f'10.{i}.0.0/16', shared) for i in range(256)) == 256
     assert calls == 1, 'the same object is converted once per call'
     assert t['10.7.0.1'] == shared

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from pysubnettree_rs import SubnetTreeRS
+from pysubnettree_rs import SubnetTreeBuilder, SubnetTreeRS
 
 from .conftest import Geo, Route
 
@@ -30,12 +30,16 @@ def test_bytes_file_and_pickle(tree, tmp_path):
     tree.dump(str(path))  # overwrite, str path
     assert list(tmp_path.iterdir()) == [path], 'no temporary file left behind'
     assert SubnetTreeRS.load(path).items() == tree.items()
-    # a loaded tree is fully functional, the deduplication index is rebuilt
-    loaded = SubnetTreeRS.load(str(path))
+    # a loaded tree is immutable; loading as a builder allows modifications (the deduplication
+    # index is rebuilt: the existing value 'ten' is reused)
+    with pytest.raises(TypeError):
+        SubnetTreeRS.load(str(path))['11.0.0.0/8'] = 'new'  # type: ignore[index]
+    loaded = SubnetTreeBuilder.load(str(path))
     loaded['10.1.2.0/24'] = 'ten'
     loaded['11.0.0.0/8'] = 'new'
     assert loaded['10.1.2.3'] is loaded['10.0.0.1']
-    assert len(SubnetTreeRS.from_bytes(SubnetTreeRS().to_bytes())) == 0
+    assert loaded.stats()['distinct_values'] == 6
+    assert len(SubnetTreeRS.from_bytes(SubnetTreeBuilder().build().to_bytes())) == 0
     with pytest.raises(FileNotFoundError):
         SubnetTreeRS.load(tmp_path / 'missing')
     with pytest.raises(FileNotFoundError):
@@ -46,10 +50,10 @@ def test_invalid_and_corrupted_data():
     for data in [b'', b'garbage', b'PYSTREE\x00' + bytes(20)]:
         with pytest.raises(ValueError, match='subnet tree|checksum|version'):
             SubnetTreeRS.from_bytes(data)
-    t = SubnetTreeRS()
+    t = SubnetTreeBuilder()
     t['10.0.0.0/8'] = Route(asn=1, geo=Geo('LU'), extra={'a': 1})
     t['2001:db8::/32'] = {'x': [1.5, b'y']}
-    data = t.to_bytes()
+    data = t.build().to_bytes()
     for i in range(len(data)):
         corrupted = bytearray(data)
         corrupted[i] ^= 0x01
@@ -58,7 +62,7 @@ def test_invalid_and_corrupted_data():
 
 
 def test_concurrent_readers_and_writer():
-    t = SubnetTreeRS()
+    t = SubnetTreeBuilder()
     t.insert_many((f'10.{i}.0.0/16', i) for i in range(256))
     errors = []
 
@@ -92,7 +96,7 @@ def test_garbage_collection():
         name: str
 
     # a cycle through the value class: tree -> Node instance -> Node class -> tree
-    t = SubnetTreeRS(value_type=Node)
+    t = SubnetTreeBuilder(value_type=Node)
     t['10.0.0.0/8'] = Node('x')
     Node.tree = t  # type: ignore[attr-defined]
     ref = weakref.ref(t)
@@ -106,9 +110,9 @@ def test_sample_data():
     import ipaddress
 
     rows = [(f'{p}/{n}', asn) for p, n, asn in (line.split('\t') for line in SAMPLE.read_text().splitlines())]
-    t = SubnetTreeRS()
+    t = SubnetTreeBuilder()
     assert t.insert_many(rows) == len(dict(rows))
-    restored = SubnetTreeRS.from_bytes(t.to_bytes())
+    restored = SubnetTreeRS.from_bytes(t.build().to_bytes())
     for net, asn in rows[::50]:
         network = ipaddress.ip_network(net)
         found_net, found = restored.lookup(str(network.network_address)) or ('', None)

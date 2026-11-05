@@ -101,13 +101,15 @@ def run(impl: str, lookups: int, runs: int) -> dict[str, float]:
     result: dict[str, float] = {'networks': len(rows)}
 
     if impl == 'pysubnettree-rs':
-        from pysubnettree_rs import SubnetTreeRS
+        from pysubnettree_rs import SubnetTreeBuilder, SubnetTreeRS
 
         t0 = time.perf_counter()
-        tree = SubnetTreeRS()
-        tree.insert_many(rows)
-        tree.compile()
+        builder = SubnetTreeBuilder()
+        builder.insert_many(rows)
+        tree = builder.build()
         result['load_s'] = time.perf_counter() - t0
+        # steady state: only the immutable tree is kept
+        del builder
         result['memory_mb'] = (rss_bytes() - rss_before) / 1e6
         lookup: Callable[[str], object] = tree.get
         t0 = time.perf_counter()
@@ -149,7 +151,7 @@ def check_release_build() -> None:
         sys.exit('the installed extension is a debug build, run: uv run --group bench maturin develop --release --uv')
 
 
-def environment(lookups: int, runs: int) -> str:
+def environment(lookups: int, runs: int, repeat: int) -> str:
     """One line describing the machine and the versions."""
     cpu = next(
         (line.split(':', 1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')), platform.processor()
@@ -161,10 +163,10 @@ def environment(lookups: int, runs: int) -> str:
         except importlib.metadata.PackageNotFoundError:
             pass
     versions_text = ', '.join(versions)
-    return f'{cpu}, Python {platform.python_version()}, {versions_text}; {lookups:,} lookups per set, median of {runs} runs.'
+    return f'{cpu}, Python {platform.python_version()}, {versions_text}; {lookups:,} lookups per set, median of {runs} passes in each of {repeat} processes.'
 
 
-def table(results: dict[str, dict[str, float]], lookups: int, runs: int) -> str:
+def table(results: dict[str, dict[str, float]], lookups: int, runs: int, repeat: int) -> str:
     """The README comparison table."""
     ours, theirs = results['pysubnettree-rs'], results.get('pysubnettree', {})
 
@@ -172,7 +174,7 @@ def table(results: dict[str, dict[str, float]], lookups: int, runs: int) -> str:
         return fmt.format(r[key]) if key in r else 'n/a'
 
     lines = [
-        environment(lookups, runs),
+        environment(lookups, runs, repeat),
         '',
         '| | pysubnettree-rs | [pysubnettree](https://github.com/zeek/pysubnettree) |',
         '|---|---:|---:|',
@@ -191,7 +193,8 @@ def main() -> None:
     """Run all available implementations and print or update the comparison table."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--lookups', type=int, default=1_000_000, help='lookups per probe set')
-    parser.add_argument('--runs', type=int, default=3, help='timing passes, the median is reported')
+    parser.add_argument('--runs', type=int, default=3, help='timing passes per process, the median is used')
+    parser.add_argument('--repeat', type=int, default=3, help='fresh processes per implementation, the median is reported')
     parser.add_argument('--update', type=Path, help='file whose table between the markers is replaced')
     parser.add_argument('--impl', help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -209,12 +212,17 @@ def main() -> None:
 
     results = {}
     for impl in impls:
-        print(f'running {impl} ...', file=sys.stderr)
-        cmd = [sys.executable, __file__, '--impl', impl, '--lookups', str(args.lookups), '--runs', str(args.runs)]
-        out = subprocess.run(cmd, check=True, capture_output=True, text=True)  # noqa: S603
-        results[impl] = json.loads(out.stdout)
+        # every repetition is a fresh process (memory placement varies between processes);
+        # each metric is the median over the repetitions
+        runs = []
+        for i in range(args.repeat):
+            print(f'running {impl} ({i + 1}/{args.repeat}) ...', file=sys.stderr)
+            cmd = [sys.executable, __file__, '--impl', impl, '--lookups', str(args.lookups), '--runs', str(args.runs)]
+            out = subprocess.run(cmd, check=True, capture_output=True, text=True)  # noqa: S603
+            runs.append(json.loads(out.stdout))
+        results[impl] = {key: statistics.median(r[key] for r in runs) for key in runs[0]}
 
-    text = table(results, args.lookups, args.runs)
+    text = table(results, args.lookups, args.runs, args.repeat)
     if args.update is None:
         print(text)
         return

@@ -1,14 +1,15 @@
 # pysubnettree-rs
 
-pysubnettree_rs finds the most specific network that contains an IP address (longest prefix match),
+pysubnettree-rs finds the most specific network that contains an IP address (longest prefix match),
 fast and with little memory. It handles IPv4 and IPv6 and is written in safe Rust.
 
 ```python
-from pysubnettree_rs import SubnetTreeRS
+from pysubnettree_rs import SubnetTreeBuilder
 
-tree = SubnetTreeRS()
-tree['10.0.0.0/8'] = {'name': 'private'}
-tree['10.1.0.0/16'] = {'name': 'office'}
+builder = SubnetTreeBuilder()
+builder['10.0.0.0/8'] = {'name': 'private'}
+builder['10.1.0.0/16'] = {'name': 'office'}
+tree = builder.build()   # immutable and lock-free
 
 tree['10.1.2.3']     # mappingproxy({'name': 'office'}), values are read-only
 tree.dump('networks.pst')
@@ -17,7 +18,7 @@ tree.dump('networks.pst')
 ## Installation
 
 ```shell
-pip install pysubnettree_rs
+pip install pysubnettree-rs
 ```
 
 Requires Python 3.11 or newer. Free-threaded Python (3.14t) is supported.

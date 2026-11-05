@@ -2,28 +2,39 @@
 
 ## Building a tree
 
-A new `SubnetTreeRS` is empty. Add networks in CIDR notation. A plain address is a host route
-(`/32` or `/128`). Host bits are ignored, so `10.1.2.3/8` is stored as `10.0.0.0/8`.
+Trees are built with a `SubnetTreeBuilder` and queried as an immutable `SubnetTreeRS`.
+
+Add networks in CIDR notation. A plain address is a host route (`/32` or `/128`). Host bits are
+ignored, so `10.1.2.3/8` is stored as `10.0.0.0/8`.
 
 ```python
-from pysubnettree_rs import SubnetTreeRS
+from pysubnettree_rs import SubnetTreeBuilder
 
-tree = SubnetTreeRS()
-tree.insert('10.0.0.0/8', {'asn': 64512})
-tree['192.0.2.0/24'] = 'documentation'   # same as insert
-tree.insert('2001:db8::/32')              # no value, lookups return None
+builder = SubnetTreeBuilder()
+builder.insert('10.0.0.0/8', {'asn': 64512})
+builder['192.0.2.0/24'] = 'documentation'   # same as insert
+builder.insert('2001:db8::/32')              # no value, lookups return None
 
 # bulk loading is faster: from a mapping or an iterable of (network, value) pairs
-tree.insert_many({'198.51.100.0/24': 1, '203.0.113.0/24': 2})
-tree.insert_many((row.network, row.value) for row in rows)
+builder.insert_many({'198.51.100.0/24': 1, '203.0.113.0/24': 2})
+builder.insert_many((row.network, row.value) for row in rows)
+
+tree = builder.build()   # SubnetTreeRS: an immutable copy
+del builder              # free the builder once it is no longer needed
 ```
 
 Networks and lookup keys can also be given as `ipaddress` objects or as packed `bytes` (4 or 16
 bytes).
 
-!!! tip "Load first, query second"
-    Modifications are buffered, and the next lookup rebuilds the lookup structure in `O(n)`.
-    Insert everything first, then call `compile()` (optional), then query.
+`build()` copies the contents, so the builder stays usable and independent: later changes to
+the builder do not affect the tree. While both exist, the data is in memory twice.
+
+The builder supports the same lookups as the tree, for convenience while building. These take a
+lock and compile pending modifications first, which costs `O(n)` after every modification. For
+queries, use the built tree.
+
+To modify an existing tree, get a builder: `tree.to_builder()`, or
+`SubnetTreeBuilder.load(path)` for a saved one.
 
 ## Values
 
@@ -58,7 +69,7 @@ type-exact: `1`, `1.0` and `True` are kept apart, although Python considers them
 ```python
 from dataclasses import dataclass
 
-from pysubnettree_rs import SubnetTreeRS
+from pysubnettree_rs import SubnetTreeBuilder
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,10 +78,11 @@ class Route:
     country: str | None = None
 
 
-tree = SubnetTreeRS(value_type=Route)    # mypy: SubnetTreeRS[Route]
-tree['10.0.0.0/8'] = Route(asn=64512)
-route = tree['10.1.2.3']                 # mypy: Route | None
-tree['192.0.2.0/24'] = 'x'               # mypy error, TypeError at runtime
+builder = SubnetTreeBuilder(value_type=Route)   # mypy: SubnetTreeBuilder[Route]
+builder['10.0.0.0/8'] = Route(asn=64512)
+builder['192.0.2.0/24'] = 'x'                   # mypy error, TypeError at runtime
+tree = builder.build()                          # mypy: SubnetTreeRS[Route]
+route = tree['10.1.2.3']                        # mypy: Route | None
 ```
 
 With `value_type`, every value must be an instance of that type, or `None`. Without it, any
@@ -105,10 +117,12 @@ Exact matches without longest prefix matching: `has_network(network)` and
 
 ## Removing networks
 
+On a builder:
+
 ```python
-tree.remove('10.0.0.0/8')    # returns the value, KeyError if the network does not exist
-del tree['192.0.2.0/24']
-tree.clear()
+builder.remove('10.0.0.0/8')    # returns the value, KeyError if the network does not exist
+del builder['192.0.2.0/24']
+builder.clear()
 ```
 
 ## Saving and loading
@@ -122,18 +136,30 @@ tree = SubnetTreeRS.from_bytes(data)
 
 # data with dataclasses / pydantic models: pass the classes, they are never imported by name
 tree = SubnetTreeRS.load('routes.pst', value_type=Route, types=[Geo])
+
+# to modify a saved tree, load it as a builder
+builder = SubnetTreeBuilder.load('networks.pst')
 ```
 
 Loading checks the checksum and the structure of the data and raises `ValueError` for corrupted
-or invalid input. Trees also support `pickle`.
+or invalid input. Trees and builders also support `pickle`.
 
 ## Threads
 
-A `SubnetTreeRS` can be used from several threads at once. Lookups run in parallel on
-free-threaded Python. Modifications take an exclusive lock. Building the lookup structure and
-file I/O release the GIL.
+A `SubnetTreeRS` is immutable and uses no locks, so it can be shared between threads freely. On
+free-threaded Python (3.14t), its lookups scale with the number of threads: about 7.6× on 8
+threads for `in`, and about 6.4× for `get()`.
+
+`get()` scales slightly less because all threads receive the *same* cached value objects, and
+free-threaded CPython updates the reference counts of objects shared between threads
+atomically. The same applies to the keys: threads iterating one shared list of key strings slow
+each other down. Give each thread its own keys.
+
+A `SubnetTreeBuilder` can also be used from several threads, but every call takes a lock. Its
+lookups scale only to about 2.5–3.8× on 8 threads. Building the lookup structure and file I/O
+release the GIL.
 
 ## Inspection
 
 `len(tree)`, `iter(tree)` (networks as strings, IPv4 first, sorted), `tree.items()`,
-`tree.stats()`, and `tree.memory_usage()`.
+`tree.stats()`, and `tree.memory_usage()`; the same on a builder.

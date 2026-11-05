@@ -391,6 +391,13 @@ impl<P> ValueStore<P> {
         self.entries.iter().map(|(_, p)| p)
     }
 
+    /// A copy with payloads produced by `clone` (e.g. `Py::clone_ref`, Python objects are not
+    /// `Clone`). The deduplication index is rebuilt lazily by the copy.
+    pub fn clone_with<Q>(&self, mut clone: impl FnMut(&P) -> Q) -> ValueStore<Q> {
+        let entries = self.entries.iter().map(|(e, p)| (Arc::clone(e), clone(p))).collect();
+        ValueStore { entries, dedup: None }
+    }
+
     /// Id of an already stored encoded value.
     pub fn find(&mut self, encoded: &[u8]) -> Option<u32> {
         self.dedup_index().get(encoded).copied()
@@ -536,6 +543,11 @@ mod tests {
         // the dedup index is rebuilt after compaction
         assert_eq!(store.intern(blob(2), "d"), (0, Some("d")));
         assert_eq!(store.intern(blob(1), "e"), (1, None));
+        assert_eq!(store.len(), 2);
+        // copies are independent and keep the ids
+        let mut copy = store.clone_with(|p| p.to_uppercase());
+        assert_eq!(copy.payload(1), "E");
+        assert_eq!(copy.intern(blob(3), "F".to_owned()), (2, None));
         assert_eq!(store.len(), 2);
     }
 }
