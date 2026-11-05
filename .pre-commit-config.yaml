@@ -1,0 +1,87 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+default_language_version:
+  python: ">=3.11"
+
+exclude: |
+  (?x)^(
+    sample/.*|
+    target/.*|
+    site/.*|
+    .venv/.*|
+  )$
+
+repos:
+  - repo: builtin
+    hooks:
+      - id: check-added-large-files
+        args: ['--maxkb=750']
+        exclude: ^uv.lock$
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: fix-byte-order-marker
+      - id: check-json
+      - id: check-toml
+      - id: check-yaml
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-symlinks
+      - id: check-merge-conflict
+      - id: check-executables-have-shebangs
+
+  - repo: local
+    hooks:
+      - id: local-ruff-check
+        name: ruff check
+        entry: uv run --no-sync ruff check --force-exclude --fix --exit-non-zero-on-fix
+        require_serial: true
+        language: system
+        types_or: [python, pyi]
+
+      - id: local-ruff-format
+        name: ruff format
+        entry: uv run --no-sync ruff format --force-exclude --exit-non-zero-on-format
+        require_serial: true
+        language: system
+        types_or: [python, pyi]
+
+      - id: mypy
+        name: mypy
+        entry: uv run --no-sync mypy
+        # check the files configured in pyproject.toml instead of only the changed ones
+        pass_filenames: false
+        require_serial: true
+        language: system
+        types_or: [python, pyi]
+
+      - id: codespell
+        name: codespell
+        entry: uv run --no-sync codespell
+        language: system
+        types: [text]
+
+      # auto-fix first (like ruff --fix), then format, then fail on anything left
+      - id: cargo-clippy-fix
+        name: cargo clippy --fix
+        entry: cargo clippy --fix --allow-dirty --allow-staged --all-targets --all-features --quiet
+        pass_filenames: false
+        require_serial: true
+        language: system
+        types: [rust]
+
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all
+        pass_filenames: false
+        require_serial: true
+        language: system
+        types: [rust]
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets --all-features --quiet -- -D warnings
+        pass_filenames: false
+        require_serial: true
+        language: system
+        types: [rust]

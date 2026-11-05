@@ -1,0 +1,27 @@
+[package]
+name = "pysubnettree-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Fast, memory-efficient longest-prefix-match lookups of IPv4/IPv6 subnets for Python"
+license = "Apache-2.0"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "pysubnettree_rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["python"]
+# The Python bindings. Disable (`--no-default-features`) to test the pure Rust core without libpython.
+python = ["dep:pyo3"]
+
+[dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+pyo3 = { version = "0.30", optional = true }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
