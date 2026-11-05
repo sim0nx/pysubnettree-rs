@@ -19,6 +19,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+defaults:
+  run:
+    # the same shell on Linux, macOS and Windows (Git Bash)
+    shell: bash
+
 jobs:
   lint:
     name: Lint (prek) and docs
@@ -33,12 +38,14 @@ jobs:
           workspaces: |
             .
             research/lpm-bench
-      - uses: astral-sh/setup-uv@v10
+      - uses: actions/setup-python@v7
+        id: python
         with:
           python-version: '3.14'
-          enable-cache: true
       - name: Install dependencies
-        run: uv sync --group dev --group docs
+        run: |
+          '${{ steps.python.outputs.python-path }}' -m pip install uv
+          uv sync --group dev --group docs --python '${{ steps.python.outputs.python-path }}'
       - name: prek (ruff, mypy, codespell, rustfmt, clippy, ...)
         # hooks that modify files (formatters, fixers) fail the run, so the diff is shown
         run: uv run --no-sync prek run --all-files --show-diff-on-failure
@@ -72,11 +79,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
-      - uses: astral-sh/setup-uv@v10
-        with:
-          enable-cache: true
       - name: Build and install (debug build of the extension)
-        run: uv sync --group test --python '${{ steps.python.outputs.python-path }}'
+        run: |
+          '${{ steps.python.outputs.python-path }}' -m pip install uv
+          uv sync --group test --python '${{ steps.python.outputs.python-path }}'
       - name: Free-threaded Python keeps the GIL disabled
         if: endsWith(matrix.python-version, 't')
         run: uv run --no-sync python -c "import sys, pysubnettree_rs; assert not sys._is_gil_enabled(), 'importing the extension enabled the GIL'"
@@ -112,12 +118,14 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      - uses: astral-sh/setup-uv@v10
+      - uses: actions/setup-python@v7
+        id: python
         with:
           python-version: '3.14'
-          enable-cache: true
       - name: Install dependencies
-        run: uv sync --group dev
+        run: |
+          '${{ steps.python.outputs.python-path }}' -m pip install uv
+          uv sync --group dev --python '${{ steps.python.outputs.python-path }}'
       - name: Coverage
         # instrumented extension under pytest + cargo test, merged into coverage.lcov
         run: ./scripts/coverage.sh

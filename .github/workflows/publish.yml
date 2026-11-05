@@ -123,9 +123,9 @@ jobs:
         with:
           name: wheels-linux-auto-x86_64
           path: dist/
-      - uses: astral-sh/setup-uv@v10
       - name: Install the wheel and run the tests against it
         run: |
+          '${{ steps.python.outputs.python-path }}' -m pip install uv
           uv venv --python '${{ steps.python.outputs.python-path }}' .venv-wheel
           uv pip install --python .venv-wheel --no-index --find-links dist/ pysubnettree-rs
           uv pip install --python .venv-wheel pytest hypothesis pydantic
