@@ -10,28 +10,24 @@ use pyo3::sync::RwLockExt;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyMapping, PyString, PyTuple, PyType};
 use pyo3::{PyTraverseError, PyVisit};
 
-use super::data::{Data, Payload, Slot, check_value_type, missing, ready, ready_pairs, repr, stats_dict, to_pairs};
+use super::data::{Collected, Data, Payload, Slot, check_value_type, missing, repr, stats_dict, to_pairs};
 use super::frozen::SubnetTreeRS;
 use super::keys::{extract_key, extract_network};
-use super::values::{Encoder, TypeInfo, build, is_cacheable, remap_types};
+use super::values::{Encoder, TypeInfo, build, is_cacheable};
 use crate::tree::Network;
-use crate::value::{Value, encode as encode_value};
+use crate::value::Value;
 
 /// Number of `(network, value)` pairs converted before taking the lock in `insert_many`.
 const INSERT_CHUNK: usize = 16 * 1024;
 
 /// A value converted outside of the lock, ready to be stored.
 struct Prepared {
-    encoded: Encoded,
-    payload: Payload,
-}
-
-enum Encoded {
-    /// Final canonical encoding (the value contains no dataclass/model objects).
-    Ready(Arc<[u8]>),
-    /// Contains objects whose type ids refer to the encoder's local types; encoded under the
-    /// lock once the tree's type ids are known.
-    Local(Value),
+    /// Object type ids refer to the encoder's local types. Encoded under the lock: the tree's
+    /// type ids and string ids are only known there.
+    value: Value,
+    /// The object returned by lookups, if it is the inserted object itself (immutable scalars).
+    /// Other values' objects are built on first use.
+    payload: Option<Payload>,
 }
 
 /// A prepared value, owned or shared (the same object inserted for many networks).
@@ -74,9 +70,7 @@ pub struct SubnetTreeBuilder {
 }
 
 impl SubnetTreeBuilder {
-    /// The objects of all values of `data` must be built (lookups under the lock never build).
     pub(crate) fn from_data(data: Data, value_type: Option<Py<PyType>>) -> Self {
-        debug_assert_eq!(data.materialized(), data.tree.value_count());
         Self { inner: RwLock::new(data), value_type }
     }
 
@@ -107,6 +101,17 @@ impl SubnetTreeBuilder {
         }
     }
 
+    /// Builds the objects of lookup results which have none yet, after the lock is released
+    /// (see [`Collected::resolve`]).
+    fn resolve<T>(&self, py: Python<'_>, collected: Collected<T>) -> PyResult<Vec<(T, Payload)>> {
+        collected.resolve(py, || self.read(py))
+    }
+
+    /// Like [`Self::resolve`], for a single optional result.
+    fn resolve_one(&self, py: Python<'_>, collected: Collected<()>) -> PyResult<Option<Payload>> {
+        Ok(self.resolve(py, collected)?.pop().map(|((), p)| p))
+    }
+
     /// Converts a value (outside of the lock).
     fn prepare(&self, py: Python<'_>, encoder: &mut Encoder, value: &Bound<'_, PyAny>) -> PyResult<Prepared> {
         if let Some(cls) = &self.value_type
@@ -119,18 +124,14 @@ impl SubnetTreeBuilder {
                 value.get_type().qualname()?
             )));
         }
-        let encoded_value = encoder.encode(value)?;
-        let payload = if is_immutable_scalar(value) {
-            value.clone().unbind()
-        } else {
-            build(py, &encoded_value, &encoder.types)?.unbind()
-        };
-        let encoded = if has_objects(&encoded_value) {
-            Encoded::Local(encoded_value)
-        } else {
-            Encoded::Ready(encode_value(&encoded_value).into())
-        };
-        Ok(Prepared { encoded, payload })
+        let converted = encoder.encode(value)?;
+        let payload = is_immutable_scalar(value).then(|| value.clone().unbind());
+        if has_objects(&converted) {
+            // the object is built on first use; building it once now raises errors (e.g. of a
+            // `__post_init__` or a validator) here rather than in a later lookup
+            drop(build(py, &converted, &encoder.types)?);
+        }
+        Ok(Prepared { value: converted, payload })
     }
 
     /// Stores prepared values. Returns the number of new networks and the payloads to drop
@@ -146,27 +147,31 @@ impl SubnetTreeBuilder {
         let map = data.map_types(py, local_types)?;
         let mut added = 0;
         let mut unused = Vec::new();
-        // values with objects are encoded here; shared ones only once per call
-        let mut shared: HashMap<*const Prepared, Arc<[u8]>> = HashMap::new();
-        let finish = |encoded: &Encoded| match encoded {
-            Encoded::Ready(blob) => Arc::clone(blob),
-            Encoded::Local(value) => {
-                let mut value = value.clone();
-                remap_types(&mut value, &map);
-                encode_value(&value).into()
-            }
-        };
+        // shared values are encoded and stored only once per call (the ids stay valid: the
+        // tree is not compiled meanwhile)
+        let mut shared: HashMap<*const Prepared, u32> = HashMap::new();
+        let slot = |payload: Option<Payload>| payload.map_or_else(Slot::new, Slot::from);
         for (net, item) in items {
-            let (blob, payload) = match item {
-                Item::Owned(p) => (finish(&p.encoded), p.payload),
-                Item::Shared(p) => {
-                    let blob = Arc::clone(shared.entry(Arc::as_ptr(&p)).or_insert_with(|| finish(&p.encoded)));
-                    (blob, p.payload.clone_ref(py))
+            let id = match item {
+                Item::Owned(p) => {
+                    let encoded = data.tree.encode(&p.value, Some(&map));
+                    let (id, payload) = data.tree.add_value(&encoded, slot(p.payload));
+                    unused.extend(payload);
+                    id
                 }
+                Item::Shared(p) => match shared.get(&Arc::as_ptr(&p)) {
+                    Some(&id) => id,
+                    None => {
+                        let encoded = data.tree.encode(&p.value, Some(&map));
+                        let payload = p.payload.as_ref().map(|p| p.clone_ref(py));
+                        let (id, payload) = data.tree.add_value(&encoded, slot(payload));
+                        unused.extend(payload);
+                        shared.insert(Arc::as_ptr(&p), id);
+                        id
+                    }
+                },
             };
-            let (new, payload) = data.tree.insert(net, blob, Slot::from(payload));
-            added += usize::from(new);
-            unused.extend(payload);
+            added += usize::from(data.tree.insert_id(net, id));
         }
         Ok((added, unused))
     }
@@ -190,7 +195,8 @@ impl SubnetTreeBuilder {
     }
 
     /// An immutable tree with a copy of the current contents. The builder stays usable and
-    /// independent of the tree; drop it when it is no longer needed to free its memory.
+    /// independent of the tree; drop it when it is no longer needed to free its memory. To
+    /// only save the contents, :meth:`dump` needs less memory.
     fn build(&self, py: Python<'_>) -> SubnetTreeRS {
         // copying under the read lock only increments reference counts, no Python code runs
         let data = self.compiled(py).clone_ref(py);
@@ -220,7 +226,8 @@ impl SubnetTreeBuilder {
         let items = if let Ok(m) = items.cast::<PyMapping>() { m.items()?.into_any() } else { items.clone() };
         let mut encoder = Encoder::default();
         // frozen dataclass/model instances are often reused for many networks: convert each
-        // object once per call (the reference keeps the object, and so its id, alive)
+        // object once per chunk (the reference keeps the object, and so its id, alive). Not
+        // once per call: that would keep every object and its conversion alive until the end.
         let mut cache: HashMap<usize, (Py<PyAny>, Arc<Prepared>)> = HashMap::new();
         let mut added = 0;
         let mut chunk = Vec::with_capacity(INSERT_CHUNK);
@@ -246,6 +253,7 @@ impl SubnetTreeBuilder {
                 let (n, unused) = self.store(py, &encoder.types, chunk.drain(..))?;
                 added += n;
                 drop(unused);
+                cache.clear();
             }
         }
         let (n, unused) = self.store(py, &encoder.types, chunk)?;
@@ -260,12 +268,35 @@ impl SubnetTreeBuilder {
     /// Removes exactly this network and returns its value. Raises KeyError if it does not exist.
     fn remove(&self, py: Python<'_>, network: &Bound<'_, PyAny>) -> PyResult<Payload> {
         let net = extract_network(network)?;
-        let removed = self.write(py).tree.remove(net).map(|e| ready(py, e));
-        removed.ok_or_else(|| missing(network))
+        loop {
+            // the value's object first, built outside the lock if needed: if building fails,
+            // the error is raised and nothing is removed
+            let found = {
+                let data = self.read(py);
+                data.get_exact(net).map(|e| data.collect(py, [((), e)]))
+            };
+            let Some(found) = found else { return Err(missing(network)) };
+            let value = self.resolve_one(py, found)?.expect("one result");
+            let mut data = self.write(py);
+            // the object is stored in the tree now: remove the network only if it still has
+            // this value, it may have been changed meanwhile
+            let unchanged =
+                data.get_exact(net).and_then(|e| e.payload().get()).is_some_and(|p| p.as_ptr() == value.as_ptr());
+            if unchanged {
+                data.tree.remove(net);
+                drop(data);
+                return Ok(value);
+            }
+            // changed by another thread: try again, dropping our object after the lock
+            drop(data);
+        }
     }
 
     fn __delitem__(&self, py: Python<'_>, network: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.remove(py, network).map(|_| ())
+        // no object needed, nothing is built
+        let net = extract_network(network)?;
+        let removed = self.write(py).tree.remove(net).is_some();
+        if removed { Ok(()) } else { Err(missing(network)) }
     }
 
     /// Removes all networks.
@@ -285,8 +316,12 @@ impl SubnetTreeBuilder {
     /// Raises KeyError if there is none.
     fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Payload> {
         let k = extract_key(key)?;
-        let found = self.compiled(py).find_value(k).map(|e| ready(py, e));
-        found.ok_or_else(|| missing(key))
+        let found = {
+            let data = self.compiled(py);
+            data.find_value(k).map(|e| data.collect(py, [((), e)]))
+        };
+        let value = found.map(|c| self.resolve_one(py, c)).transpose()?.flatten();
+        value.ok_or_else(|| missing(key))
     }
 
     /// Value of the most specific network containing the address (or network), ``default`` if
@@ -294,15 +329,23 @@ impl SubnetTreeBuilder {
     #[pyo3(signature = (key, default = None))]
     fn get(&self, py: Python<'_>, key: &Bound<'_, PyAny>, default: Option<Payload>) -> PyResult<Payload> {
         let k = extract_key(key)?;
-        let found = self.compiled(py).find_value(k).map(|e| ready(py, e));
-        Ok(found.or(default).unwrap_or_else(|| py.None()))
+        let found = {
+            let data = self.compiled(py);
+            data.find_value(k).map(|e| data.collect(py, [((), e)]))
+        };
+        let value = found.map(|c| self.resolve_one(py, c)).transpose()?.flatten();
+        Ok(value.or(default).unwrap_or_else(|| py.None()))
     }
 
     /// ``(network, value)`` of the most specific network containing the address (or network),
     /// None if there is none.
     fn lookup(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Option<(String, Payload)>> {
         let k = extract_key(key)?;
-        let found = self.compiled(py).find(k).map(|(n, e)| (n, ready(py, e)));
+        let found = {
+            let data = self.compiled(py);
+            data.find(k).map(|m| data.collect(py, [m]))
+        };
+        let found = found.map(|c| self.resolve(py, c)).transpose()?.and_then(|mut v| v.pop());
         Ok(found.map(|(n, p)| (n.to_string(), p)))
     }
 
@@ -310,8 +353,11 @@ impl SubnetTreeBuilder {
     /// first.
     fn lookup_all<'py>(&self, py: Python<'py>, key: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> {
         let k = extract_key(key)?;
-        let matches = ready_pairs(py, self.compiled(py).matches(k).into_iter());
-        to_pairs(py, matches)
+        let matches = {
+            let data = self.compiled(py);
+            data.collect(py, data.matches(k))
+        };
+        to_pairs(py, self.resolve(py, matches)?)
     }
 
     /// True if any network contains the address (or network).
@@ -331,8 +377,12 @@ impl SubnetTreeBuilder {
     #[pyo3(signature = (network, default = None))]
     fn get_exact(&self, py: Python<'_>, network: &Bound<'_, PyAny>, default: Option<Payload>) -> PyResult<Payload> {
         let net = extract_network(network)?;
-        let found = self.read(py).get_exact(net).map(|e| ready(py, e));
-        Ok(found.or(default).unwrap_or_else(|| py.None()))
+        let found = {
+            let data = self.read(py);
+            data.get_exact(net).map(|e| data.collect(py, [((), e)]))
+        };
+        let value = found.map(|c| self.resolve_one(py, c)).transpose()?.flatten();
+        Ok(value.or(default).unwrap_or_else(|| py.None()))
     }
 
     fn __len__(&self, py: Python<'_>) -> usize {
@@ -347,8 +397,11 @@ impl SubnetTreeBuilder {
 
     /// List of all ``(network, value)`` pairs (IPv4 first, sorted).
     fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let entries = ready_pairs(py, self.compiled(py).entries());
-        to_pairs(py, entries)
+        let entries = {
+            let data = self.compiled(py);
+            data.collect(py, data.entries())
+        };
+        to_pairs(py, self.resolve(py, entries)?)
     }
 
     /// Approximate memory used in bytes (excluding the Python value objects).
@@ -363,6 +416,18 @@ impl SubnetTreeBuilder {
     }
 
     // --- serialization ---------------------------------------------------------------------
+
+    /// Serializes the contents into the compact binary format, see :meth:`SubnetTreeRS.to_bytes`.
+    fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        let data = self.compiled(py).encode(py);
+        PyBytes::new(py, &data)
+    }
+
+    /// Writes the contents to a file, see :meth:`SubnetTreeRS.dump`. Needs less memory than
+    /// ``build().dump(path)``: nothing is copied.
+    fn dump(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        self.compiled(py).dump(py, &path)
+    }
 
     /// Creates a builder from data produced by :meth:`SubnetTreeRS.to_bytes`, e.g. to modify a
     /// saved tree. See :meth:`SubnetTreeRS.from_bytes`.

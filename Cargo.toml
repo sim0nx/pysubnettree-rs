@@ -35,6 +35,8 @@ python = ["dep:pyo3"]
 
 [dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# HashTable: indexes of ids hashed by content (strings, values), 5 bytes per entry
+hashbrown = { version = "0.17", default-features = false }
 pyo3 = { version = "0.30", optional = true }
 
 [profile.release]

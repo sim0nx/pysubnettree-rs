@@ -2,10 +2,12 @@
 //!
 //! The builder calls these methods while holding its lock, so they never call into Python:
 //! keys are parsed before, and lookups return references to the stored values. The callers turn
-//! them into objects: the builder with [`ready`] (its values are always built, cloning a `Py`
-//! only increments its reference count), the immutable tree with [`Data::object`], which builds
-//! a value's object on first use (lazy loading).
+//! them into objects, building a value's object on first use (lazy): the immutable tree with
+//! [`Data::object`], the builder with [`Data::collect`] under its lock and [`Collected::resolve`]
+//! after releasing it (building runs Python code).
 
+use std::collections::HashMap;
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -18,17 +20,17 @@ use super::keys::Key;
 use super::values::{TypeInfo, build, classify};
 use crate::format;
 use crate::tree::{Match, Network, Tree};
-use crate::value::{DecodeError, Stored, decode as decode_value, head, tag};
+use crate::value::{DecodeError, Value, ValueRef, head, tag};
 
 /// The read-only Python object of a value, returned by lookups.
 pub type Payload = Py<PyAny>;
 
-/// The tree's payload: the object of a value, built on first use. Always built in a builder.
+/// The tree's payload: the object of a value, built on first use.
 /// A `std` cell, not `PyOnceLock`: `__traverse__` must read it without a `Python` token.
 pub type Slot = OnceLock<Payload>;
 
 /// A stored value: its encoding and its [`Slot`].
-pub type Entry = Stored<Slot>;
+pub type Entry<'a> = ValueRef<'a, Slot>;
 
 /// A list of `(network, value)` results, converted to Python with [`to_pairs`].
 pub type Pairs = Vec<(Network, Payload)>;
@@ -85,7 +87,7 @@ impl Data {
 
     /// The value of the longest match, the fast path of `get` and `__getitem__`.
     #[inline]
-    pub fn find_value(&self, key: Key) -> Option<&Entry> {
+    pub fn find_value(&self, key: Key) -> Option<Entry<'_>> {
         match key {
             Key::Addr(a) => self.tree.lookup_value(a),
             Key::Net(n) => self.tree.lookup_network(n).map(|(_, e)| e),
@@ -119,7 +121,7 @@ impl Data {
 
     // --- exact matches: work with pending mutations too ------------------------------------
 
-    pub fn get_exact(&self, net: Network) -> Option<&Entry> {
+    pub fn get_exact(&self, net: Network) -> Option<Entry<'_>> {
         self.tree.get_exact(net)
     }
 
@@ -130,11 +132,11 @@ impl Data {
     ///
     /// # Errors
     /// Errors raised while building the object; they are raised again on the next attempt.
-    pub fn object(&self, py: Python<'_>, entry: &Entry) -> PyResult<Payload> {
+    pub fn object(&self, py: Python<'_>, entry: Entry<'_>) -> PyResult<Payload> {
         if let Some(p) = entry.get() {
             return Ok(p.clone_ref(py));
         }
-        let value = decode_value(entry.encoded(), self.classes.len()).map_err(|e| decode_err(&e))?;
+        let value = self.tree.decode(entry.encoded()).map_err(|e| decode_err(&e))?;
         let obj = build(py, &value, &self.classes)?.unbind();
         // if another thread was faster, its object wins and ours is dropped: lookups always
         // return the same object. The closure only moves, it never blocks.
@@ -157,11 +159,6 @@ impl Data {
         Ok(())
     }
 
-    /// Number of values whose object has been built.
-    pub fn materialized(&self) -> usize {
-        self.tree.payloads().filter(|s| s.get().is_some()).count()
-    }
-
     // --- serialization ---------------------------------------------------------------------
 
     pub fn encode(&self, py: Python<'_>) -> Vec<u8> {
@@ -169,15 +166,17 @@ impl Data {
         py.detach(|| format::encode(tree))
     }
 
-    /// Writes atomically: to a temporary file which is then renamed.
+    /// Writes atomically: to a temporary file which is then renamed. The data is streamed into
+    /// the file, it is never held in memory as a whole.
     pub fn dump(&self, py: Python<'_>, path: &Path) -> PyResult<()> {
         let tree = &self.tree;
         py.detach(|| {
-            let data = format::encode(tree);
             let mut tmp = path.as_os_str().to_owned();
             tmp.push(".tmp");
-            std::fs::write(&tmp, data)?;
-            std::fs::rename(&tmp, path).inspect_err(|_| {
+            let written = std::fs::File::create(&tmp)
+                .and_then(|file| format::write(tree, file))
+                .and_then(|_| std::fs::rename(&tmp, path));
+            written.inspect_err(|_| {
                 let _ = std::fs::remove_file(&tmp);
             })
         })?;
@@ -295,18 +294,94 @@ fn check_value_types<P>(py: Python<'_>, tree: &Tree<P>, classes: &[TypeInfo], cl
     Ok(())
 }
 
-/// The object of a builder's value: always built, so this never runs Python code and is safe
-/// under the builder's lock.
-///
-/// # Panics
-/// If the value has not been built (a bug: builders build every value when storing it).
-pub fn ready(py: Python<'_>, entry: &Entry) -> Payload {
-    entry.get().expect("builder values are always built").clone_ref(py)
+/// A value found by a builder lookup under its lock: its object, or the id of a value to build
+/// the object of once the lock is released.
+enum Found {
+    Built(Payload),
+    Pending(u32),
 }
 
-/// `(network, object)` pairs of a builder, see [`ready`].
-pub fn ready_pairs<'a>(py: Python<'_>, matches: impl Iterator<Item = Match<'a, Slot>>) -> Pairs {
-    matches.map(|(n, e)| (n, ready(py, e))).collect()
+/// Results of a builder lookup, collected under its lock by [`Data::collect`].
+pub struct Collected<T> {
+    items: Vec<(T, Found)>,
+    /// The decoded values whose objects are to be built, by id.
+    pending: HashMap<u32, Result<Value, DecodeError>>,
+    /// The epoch of the value store: the ids are still valid if it is unchanged.
+    epoch: u64,
+    /// The classes of the tree's types, if any value needs to be built.
+    classes: Vec<TypeInfo>,
+}
+
+impl Data {
+    /// Collects lookup results, decoding the values to build. Never runs Python code (only
+    /// copies references), so it is safe under the builder's lock.
+    pub fn collect<'a, T>(&'a self, py: Python<'_>, items: impl IntoIterator<Item = (T, Entry<'a>)>) -> Collected<T> {
+        let mut pending = HashMap::new();
+        let items: Vec<(T, Found)> = items
+            .into_iter()
+            .map(|(t, entry)| {
+                let found = if let Some(p) = entry.get() {
+                    Found::Built(p.clone_ref(py))
+                } else {
+                    let id = entry.id();
+                    pending.entry(id).or_insert_with(|| self.tree.decode(entry.encoded()));
+                    Found::Pending(id)
+                };
+                (t, found)
+            })
+            .collect();
+        let classes =
+            if pending.is_empty() { Vec::new() } else { self.classes.iter().map(|c| c.clone_ref(py)).collect() };
+        Collected { items, pending, epoch: self.tree.values.epoch(), classes }
+    }
+}
+
+impl<T> Collected<T> {
+    /// Builds the objects of the values which have none yet and stores them in the tree, so that
+    /// later lookups return the same objects. Call without holding the lock: building runs
+    /// Python code. `lock` locks the data again to store the objects.
+    ///
+    /// # Errors
+    /// Errors raised while building an object; they are raised again on the next attempt.
+    pub fn resolve<G: Deref<Target = Data>>(
+        self,
+        py: Python<'_>,
+        lock: impl FnOnce() -> G,
+    ) -> PyResult<Vec<(T, Payload)>> {
+        let Collected { items, pending, epoch, classes } = self;
+        let mut built: HashMap<u32, Payload> = HashMap::with_capacity(pending.len());
+        for (id, value) in pending {
+            let value = value.map_err(|e| decode_err(&e))?;
+            built.insert(id, build(py, &value, &classes)?.unbind());
+        }
+        if !built.is_empty() {
+            // objects to drop after releasing the lock: dropping one may run Python code
+            let mut unused = Vec::new();
+            {
+                let data = lock();
+                let values = &data.tree.values;
+                // values may have been dropped and the ids reused meanwhile: then the objects
+                // are not stored (the next lookup builds them again)
+                let valid = values.epoch() == epoch;
+                for (&id, obj) in built.iter_mut().filter(|_| valid) {
+                    let slot = values.payload(id);
+                    if let Err(ours) = slot.set(obj.clone_ref(py)) {
+                        // another thread was faster: everyone gets its object
+                        unused.push(ours);
+                        unused.push(std::mem::replace(obj, slot.get().expect("set").clone_ref(py)));
+                    }
+                }
+            }
+            drop(unused);
+        }
+        Ok(items
+            .into_iter()
+            .map(|(t, f)| match f {
+                Found::Built(p) => (t, p),
+                Found::Pending(id) => (t, built[&id].clone_ref(py)),
+            })
+            .collect())
+    }
 }
 
 /// Python list of `(network, value)` tuples.

@@ -1,11 +1,14 @@
-//! The subnet tree: an IPv4 and an IPv6 prefix table sharing one value store.
+//! The subnet tree: an IPv4 and an IPv6 prefix table sharing one value store, and the strings
+//! of the values.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
 
+use crate::strings::{StringSet, Strings};
 use crate::table::{Addr, PrefixTable};
-use crate::value::{Stored, TypeDesc, Value, ValueStore, encode};
+use crate::value::{
+    DecodeError, Refs, TypeDesc, Value, ValueRef, ValueStore, decode, encode, remap_strings, visit_strings,
+};
 
 /// An IP network (network address with host bits cleared, prefix length).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -147,7 +150,7 @@ pub fn parse_network(s: &str) -> Result<Network, ParseError> {
 }
 
 /// A matched entry: the network and its value (encoding + payload, dereferences to the payload).
-pub type Match<'a, P> = (Network, &'a Stored<P>);
+pub type Match<'a, P> = (Network, ValueRef<'a, P>);
 
 /// IPv4 and IPv6 longest-prefix-match tables sharing a deduplicated value store.
 ///
@@ -162,6 +165,8 @@ pub struct Tree<P> {
     pub(crate) values: ValueStore<P>,
     /// Registered types referenced by [`Value::Object`] (append only).
     pub(crate) types: Vec<TypeDesc>,
+    /// The strings referenced by the encoded values.
+    pub(crate) strings: StringSet,
 }
 
 impl<P> Default for Tree<P> {
@@ -173,7 +178,13 @@ impl<P> Default for Tree<P> {
 impl<P> Tree<P> {
     #[must_use]
     pub fn new() -> Self {
-        Self { v4: PrefixTable::new(), v6: PrefixTable::new(), values: ValueStore::new(), types: Vec::new() }
+        Self {
+            v4: PrefixTable::new(),
+            v6: PrefixTable::new(),
+            values: ValueStore::new(),
+            types: Vec::new(),
+            strings: StringSet::default(),
+        }
     }
 
     /// Number of networks.
@@ -217,13 +228,39 @@ impl<P> Tree<P> {
         u32::try_from(pos).expect("too many types")
     }
 
+    /// The strings referenced by the encoded values.
+    #[must_use]
+    pub fn strings(&self) -> &Strings {
+        self.strings.strings()
+    }
+
+    /// What the encoded values refer to, to decode them.
+    #[must_use]
+    pub fn refs(&self) -> Refs<'_> {
+        Refs { types: self.types.len(), strings: self.strings.strings() }
+    }
+
+    /// Encodes a value for this tree, adding its strings. `types`, if given, maps the object
+    /// type ids of the value to the tree's (see [`Tree::register_type`]).
+    pub fn encode(&mut self, value: &Value, types: Option<&[u32]>) -> Vec<u8> {
+        encode(value, types, |s| self.strings.intern(s))
+    }
+
+    /// Decodes an encoded value of this tree.
+    ///
+    /// # Errors
+    /// If the data is not a valid value of this tree.
+    pub fn decode(&self, encoded: &[u8]) -> Result<Value, DecodeError> {
+        decode(encoded, self.refs())
+    }
+
     /// Payloads of all stored values.
     pub fn payloads(&self) -> impl Iterator<Item = &P> {
         self.values.payloads()
     }
 
     /// All stored values (encoding + payload), in id order.
-    pub fn values(&self) -> impl Iterator<Item = &Stored<P>> {
+    pub fn values(&self) -> impl Iterator<Item = ValueRef<'_, P>> {
         self.values.iter()
     }
 
@@ -232,12 +269,19 @@ impl<P> Tree<P> {
         self.values.find(encoded)
     }
 
-    /// Inserts or replaces a network with a value given by its canonical encoding (object type
-    /// ids must refer to [`Tree::types`]). Returns whether the network was new and, if the value
+    /// Inserts or replaces a network with a value given by its canonical encoding, from
+    /// [`Tree::encode`]. Returns whether the network was new and, if the value
     /// already existed, the unused `payload`.
-    pub fn insert(&mut self, net: Network, encoded: Arc<[u8]>, payload: P) -> (bool, Option<P>) {
-        let (id, unused) = self.values.intern(encoded, payload);
+    pub fn insert(&mut self, net: Network, encoded: &[u8], payload: P) -> (bool, Option<P>) {
+        let (id, unused) = self.add_value(encoded, payload);
         (self.insert_id(net, id), unused)
+    }
+
+    /// Stores a value given by its canonical encoding (from [`Tree::encode`]) unless it
+    /// exists. Returns its id and, if the value already existed, the unused `payload`. The id
+    /// stays valid until the next [`Tree::compile`].
+    pub fn add_value(&mut self, encoded: &[u8], payload: P) -> (u32, Option<P>) {
+        self.values.intern(encoded, payload)
     }
 
     /// Inserts or replaces a network with an already stored value id (see
@@ -251,7 +295,7 @@ impl<P> Tree<P> {
     }
 
     /// Removes a network, returns its value (which stays stored until the next compaction).
-    pub fn remove(&mut self, net: Network) -> Option<&Stored<P>> {
+    pub fn remove(&mut self, net: Network) -> Option<ValueRef<'_, P>> {
         let id = match net {
             Network::V4(a, l) => self.v4.remove((a, l)),
             Network::V6(a, l) => self.v6.remove((a, l)),
@@ -261,7 +305,7 @@ impl<P> Tree<P> {
 
     /// Value of exactly this network (no longest prefix match). Works without compiling.
     #[must_use]
-    pub fn get_exact(&self, net: Network) -> Option<&Stored<P>> {
+    pub fn get_exact(&self, net: Network) -> Option<ValueRef<'_, P>> {
         let id = match net {
             Network::V4(a, l) => self.v4.get_exact((a, l)),
             Network::V6(a, l) => self.v6.get_exact((a, l)),
@@ -285,7 +329,11 @@ impl<P> Tree<P> {
         }
         self.v4.compile();
         self.v6.compile();
-        self.compact_values(false)
+        let removed = self.compact_values(false);
+        // usually the last compile after a bulk load: release the room reserved for more
+        self.values.shrink();
+        self.strings.shrink();
+        removed
     }
 
     /// Removes unreferenced values, without `force` only if at least a quarter is unused.
@@ -303,24 +351,44 @@ impl<P> Tree<P> {
         let (remap, removed) = self.values.retain(&keep);
         self.v4.remap_values(&remap);
         self.v6.remap_values(&remap);
+        self.compact_strings(force);
         removed
     }
 
-    /// Replaces the payloads (e.g. after decoding from disk). `make` gets the value id and its
-    /// canonical encoding.
+    /// Removes strings no longer used by any value, without `force` only if at least a
+    /// quarter is unused. The values are encoded again with the new string ids.
+    fn compact_strings(&mut self, force: bool) {
+        let strings = self.strings.strings();
+        let types = self.types.len();
+        let mut used = vec![false; strings.len()];
+        for v in self.values.iter() {
+            visit_strings(v.encoded(), types, |id| used[id as usize] = true);
+        }
+        let unused = used.iter().filter(|&&u| !u).count();
+        if unused == 0 || (!force && unused * 4 < used.len()) {
+            return;
+        }
+        let mut kept = Strings::new();
+        let remap: Vec<u32> =
+            strings.iter().zip(&used).map(|(s, &u)| if u { kept.push(s) } else { u32::MAX }).collect();
+        self.values.rewrite_encodings(|e, out| remap_strings(e, out, types, |id| remap[id as usize]));
+        self.strings = StringSet::new(kept);
+    }
+
+    /// Replaces the payloads (e.g. after decoding from disk). `make` gets the value id, its
+    /// canonical encoding and what it refers to (to decode it).
     ///
     /// # Errors
     /// The first error returned by `make`.
-    pub fn with_payloads<Q, E>(self, mut make: impl FnMut(u32, &[u8]) -> Result<Q, E>) -> Result<Tree<Q>, E> {
-        let n = u32::try_from(self.values.len()).expect("ids fit u32");
-        let entries = (0..n)
-            .map(|id| {
-                let encoded = Arc::clone(self.values.encoded(id));
-                let payload = make(id, &encoded)?;
-                Ok((encoded, payload))
-            })
-            .collect::<Result<_, E>>()?;
-        Ok(Tree { v4: self.v4, v6: self.v6, values: ValueStore::from_entries(entries), types: self.types })
+    pub fn with_payloads<Q, E>(self, mut make: impl FnMut(u32, &[u8], Refs<'_>) -> Result<Q, E>) -> Result<Tree<Q>, E> {
+        let payloads = self.values.iter().map(|v| make(v.id(), v.encoded(), self.refs())).collect::<Result<_, E>>()?;
+        Ok(Tree {
+            values: self.values.map_payloads(payloads),
+            v4: self.v4,
+            v6: self.v6,
+            types: self.types,
+            strings: self.strings,
+        })
     }
 
     /// An independent copy; payloads are produced by `clone` (e.g. `Py::clone_ref`, Python
@@ -332,12 +400,13 @@ impl<P> Tree<P> {
             v6: self.v6.clone(),
             values: self.values.clone_with(clone),
             types: self.types.clone(),
+            strings: self.strings.share(),
         }
     }
 
     /// Canonical encoding of a stored value.
     #[must_use]
-    pub fn encoded(&self, id: u32) -> &Arc<[u8]> {
+    pub fn encoded(&self, id: u32) -> &[u8] {
         self.values.encoded(id)
     }
 
@@ -364,7 +433,7 @@ impl<P> Tree<P> {
     /// less memory than [`Tree::lookup`]). The tree must be compiled.
     #[inline]
     #[must_use]
-    pub fn lookup_value(&self, addr: Address) -> Option<&Stored<P>> {
+    pub fn lookup_value(&self, addr: Address) -> Option<ValueRef<'_, P>> {
         let id = match addr {
             Address::V4(a) => self.v4.lookup_value(a)?,
             Address::V6(a) => self.v6.lookup_value(a)?,
@@ -409,15 +478,19 @@ impl<P> Tree<P> {
     /// Approximate memory used in bytes, excluding what payloads point to.
     #[must_use]
     pub fn memory_usage(&self) -> usize {
-        size_of::<Self>() + self.v4.memory_usage() + self.v6.memory_usage() + self.values.memory_usage()
+        size_of::<Self>()
+            + self.v4.memory_usage()
+            + self.v6.memory_usage()
+            + self.values.memory_usage()
+            + self.strings.memory_usage()
     }
 }
 
 impl Tree<Value> {
     /// Convenience for Rust users (and tests): stores decoded values as their own payload.
     pub fn insert_value(&mut self, net: Network, value: Value) -> bool {
-        let encoded: Arc<[u8]> = encode(&value).into();
-        self.insert(net, encoded, value).0
+        let encoded = self.encode(&value, None);
+        self.insert(net, &encoded, value).0
     }
 }
 
@@ -466,17 +539,17 @@ mod tests {
         assert!(!t.insert_value(net("2001:db8::/32"), Value::Int(2)));
         assert_eq!(t.len(), 3);
         assert_eq!(t.compile(), vec![Value::Int(1)], "the replaced value is 1 of 4 (25 %): compacted");
-        assert_eq!(t.lookup(addr("10.1.2.3")).map(|(n, v)| (n, &**v)), Some((net("10.1.0.0/16"), &Value::Null)));
+        assert_eq!(t.lookup(addr("10.1.2.3")).map(|(n, v)| (n, v.payload())), Some((net("10.1.0.0/16"), &Value::Null)));
         assert_eq!(
-            t.lookup(addr("10.2.2.3")).map(|(n, v)| (n, &**v)),
+            t.lookup(addr("10.2.2.3")).map(|(n, v)| (n, v.payload())),
             Some((net("10.0.0.0/8"), &Value::Str("ten".into())))
         );
-        assert_eq!(t.lookup_value(addr("2001:db8::1")).map(|v| &**v), Some(&Value::Int(2)));
-        assert_eq!(t.lookup_value(addr("::ffff:10.0.0.1")).map(|v| &**v), Some(&Value::Str("ten".into())));
+        assert_eq!(t.lookup_value(addr("2001:db8::1")).map(|v| v.payload()), Some(&Value::Int(2)));
+        assert_eq!(t.lookup_value(addr("::ffff:10.0.0.1")).map(|v| v.payload()), Some(&Value::Str("ten".into())));
         assert!(t.lookup(addr("2001:db9::1")).is_none());
         let m: Vec<_> = t.matches(net("10.1.2.3")).into_iter().map(|(n, _)| n.to_string()).collect();
         assert_eq!(m, vec!["10.1.0.0/16", "10.0.0.0/8"]);
-        assert_eq!(t.remove(net("10.1.0.0/16")).map(|v| &**v), Some(&Value::Null));
+        assert_eq!(t.remove(net("10.1.0.0/16")).map(|v| v.payload()), Some(&Value::Null));
         assert!(t.remove(net("10.1.0.0/16")).is_none());
         let _ = t.compile();
         assert_eq!(t.lookup(addr("10.1.2.3")).unwrap().0, net("10.0.0.0/8"));
@@ -490,9 +563,10 @@ mod tests {
         assert_eq!(t.value_count(), 100);
         assert_eq!(t.compile().len(), 99);
         assert_eq!(t.value_count(), 1);
-        assert_eq!(t.lookup_value(addr("10.0.0.1")).map(|v| &**v), Some(&Value::Int(99)));
+        assert_eq!(t.lookup_value(addr("10.0.0.1")).map(|v| v.payload()), Some(&Value::Int(99)));
         // the dedup index is consistent after compaction
-        assert_eq!(t.find_value(&encode(&Value::Int(99))), Some(0));
+        let encoded = t.encode(&Value::Int(99), None);
+        assert_eq!(t.find_value(&encoded), Some(0));
         t.insert_value(net("11.0.0.0/8"), Value::Int(99));
         assert_eq!(t.value_count(), 1);
 
@@ -504,8 +578,39 @@ mod tests {
         let _ = t.compile();
         assert_eq!(t.len(), 2);
         assert_eq!(copy.len(), 2);
-        assert_eq!(t.lookup_value(addr("10.0.0.1")).map(|v| &**v), Some(&Value::Int(99)));
-        assert_eq!(copy.lookup_value(addr("10.0.0.1")).map(|v| &**v), None);
-        assert_eq!(copy.lookup_value(addr("12.0.0.1")).map(|v| &**v), Some(&Value::Int(5)));
+        assert_eq!(t.lookup_value(addr("10.0.0.1")).map(|v| v.payload()), Some(&Value::Int(99)));
+        assert_eq!(copy.lookup_value(addr("10.0.0.1")).map(|v| v.payload()), None);
+        assert_eq!(copy.lookup_value(addr("12.0.0.1")).map(|v| v.payload()), Some(&Value::Int(5)));
+    }
+
+    #[test]
+    fn shared_strings_are_compacted() {
+        let s = |s: &str| Value::Str(s.into());
+        let pair = |a: &str, b: &str| Value::Seq(vec![s(a), s(b)].into());
+        let mut t = Tree::new();
+        t.insert_value(net("10.0.0.0/8"), pair("a", "b"));
+        t.insert_value(net("11.0.0.0/8"), pair("b", "c"));
+        t.insert_value(net("12.0.0.0/8"), pair("c", "a"));
+        assert_eq!(t.strings().iter().collect::<Vec<_>>(), ["a", "b", "c"], "each string is stored once");
+        assert!(t.compile().is_empty());
+
+        // a copy shares the strings; replacing a value does not change the copy
+        let copy = t.clone_with(Value::clone);
+        t.insert_value(net("10.0.0.0/8"), pair("d", "c"));
+        t.insert_value(net("11.0.0.0/8"), pair("d", "d"));
+        assert_eq!(t.strings().len(), 4);
+        assert_eq!(t.compile().len(), 2, "two of five values unused: compacted");
+        // "b" is unused now (1 of 4 strings): removed, the values are encoded again
+        assert_eq!(t.strings().iter().collect::<Vec<_>>(), ["a", "c", "d"]);
+        let found = |t: &Tree<Value>, a: &str| t.lookup_value(addr(a)).map(|v| t.decode(v.encoded()).unwrap());
+        assert_eq!(found(&t, "10.0.0.1"), Some(pair("d", "c")));
+        assert_eq!(found(&t, "11.0.0.1"), Some(pair("d", "d")));
+        assert_eq!(found(&t, "12.0.0.1"), Some(pair("c", "a")));
+        assert_eq!(found(&copy, "10.0.0.1"), Some(pair("a", "b")));
+        assert_eq!(copy.strings().len(), 3);
+        // the deduplication index is rebuilt for the new encodings
+        let encoded = t.encode(&pair("c", "a"), None);
+        assert_eq!(t.find_value(&encoded), Some(0));
+        assert_eq!(t.strings().len(), 3);
     }
 }

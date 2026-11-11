@@ -49,36 +49,66 @@ rebuilding. The next lookup or `build()` merges the pending changes into the sor
 rebuilds the intervals in a single linear pass, using a stack of open networks.
 
 `build()` copies the compiled data into a `SubnetTreeRS`. Copying the value objects only
-increments their reference counts. Each object owns its data exclusively, which keeps memory
-management and garbage collection simple.
+increments their reference counts, and the encodings are shared. Each object owns its data
+exclusively, which keeps memory management and garbage collection simple. `dump()` on the builder
+writes the file without the copy.
+
+`dump()` streams the file: the encoded values are written as they are stored, and the checksum
+is computed along the way, so the file is never held in memory.
 
 ## Values
 
 Each distinct value is stored once, as two things:
 
 - its **canonical encoding**, a compact type-exact byte string. This is the deduplication key,
-  and it is written to disk as-is.
+  and it is written to disk with only its string ids renumbered.
 - one **read-only Python object**, built from the encoding. Lookups return it directly. Building
   it from the encoding means a lookup returns the same thing whether the tree was filled by
   inserts or loaded from disk. It lives in a once-cell (`std::sync::OnceLock`) next to the
-  encoding: a builder fills it when storing the value, a loaded `SubnetTreeRS` when a lookup
-  first returns the value. Concurrent first lookups may both build an object; the first one
-  stored wins and is returned to everyone, the other one is dropped. Building happens outside
-  any lock and is not cached when it fails.
+  encoding, filled when a lookup first returns the value. Concurrent first lookups may both
+  build an object; the first one stored wins and is returned to everyone, the other one is
+  dropped. Building happens outside any lock and is not cached when it fails. A builder looks
+  up under its lock, builds the missing objects after releasing it, and stores them under the
+  lock again, unless the value was dropped meanwhile.
+
+  Building objects lazily keeps a builder small: for a value per network, such as an IP-to-AS
+  table, the objects would take more memory than everything else. Exact instances of `str`,
+  `int`, `float`, `bool`, `bytes` and `None` are their own object and are stored on insert. A
+  value with dataclasses or models is built once on insert and dropped, so that errors raised
+  while building it are raised by the insert.
+
+Strings are stored once per tree: every distinct `str` value and every key of a mapping or
+object is kept in a string table (all strings concatenated, plus their end offsets), and
+encodings refer to it by `u32` id. Values of a type repeat its field names, and values of
+neighbouring networks often repeat the same names: storing them once makes the encodings a
+fraction of their size. A builder and the trees built from it share the table until the builder
+adds a string (copy on write). The ids are part of the canonical encoding: since every distinct
+string has one id, equal values still have equal encodings. When values are dropped, strings no
+longer used are dropped too (when at least a quarter is unused), and the remaining values are
+encoded again with the new ids. A file stores only the strings its values use, numbered in order
+of first use, so equal trees produce equal files.
+
+The encodings of all values are stored in one buffer, back to back, with the end offset of each:
+no allocation per value, which would cost more than a typical encoding (an ASN, a few string
+ids). Like the string table, the buffer is shared by a builder and the trees built from it until
+the builder adds a value. Removing values rewrites the buffer (when at least a quarter is unused,
+see below), which renumbers the values; a builder that released its lock to build an object
+checks the store's *epoch*, which changes whenever ids change, before storing the object.
 
 Networks reference values by `u32` id. The Rust core is generic over the payload: `Tree<P>`
 holds the Python object in the bindings and `()` after decoding a file. Dataclasses and pydantic
 models are encoded as objects that reference a type table. The file stores only the kind and the
 qualified name of each type, and `load()` resolves names against the classes passed in.
 
-Loading validates every value without building it (an allocation-free walk over the encoding),
-rejects duplicates by sorting seeded xxh3 hashes, and checks `value_type` on the encodings: the
+Loading validates every value without building it (a walk over the encoding that copies it in
+canonical form), rejects duplicate values and strings by sorting seeded xxh3 hashes, and checks `value_type` on the encodings: the
 class that each kind of encoded value turns into (one per tag, or the object's type) is checked
 once with `issubclass`.
 
-The deduplication index is built lazily: a tree loaded from disk does not keep it until the next
-insert. Values that are no longer referenced are dropped when at least a quarter of all values
-are unused.
+The deduplication indexes of values and strings are built lazily: a tree loaded from disk does
+not keep them until the next insert. They are hash tables of `u32` ids (`hashbrown::HashTable`),
+hashed by content with a seeded xxh3, about 5 bytes per entry. Values that are no longer
+referenced are dropped when at least a quarter of all values are unused.
 
 ## Concurrency
 

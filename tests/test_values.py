@@ -188,6 +188,6 @@ def test_insert_many_reuses_objects():
 
 
 def test_module_metadata():
-    assert pysubnettree_rs.FORMAT_VERSION == 1
+    assert pysubnettree_rs.FORMAT_VERSION == 2
     assert pysubnettree_rs.__version__
     assert SubnetTreeRS.__module__ == 'pysubnettree_rs'

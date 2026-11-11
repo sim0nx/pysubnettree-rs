@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod format;
+pub mod strings;
 pub mod table;
 pub mod tree;
 pub mod value;

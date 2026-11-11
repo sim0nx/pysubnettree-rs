@@ -3,7 +3,7 @@
 //! - [`Encoder`]: Python object → [`Value`]. Accepts `None`, `bool`, `int`, `float`, `str`,
 //!   `bytes`, `list`/`tuple`, mappings with `str` keys, frozen dataclasses and frozen pydantic
 //!   models. Object type ids refer to the encoder's own (local) type list; they are mapped to
-//!   the tree's type ids when the value is stored (see [`remap_types`]).
+//!   the tree's type ids when the value is stored and encoded.
 //! - [`build`]: [`Value`] → the read-only Python object returned by lookups: sequences become
 //!   `tuple`, mappings `types.MappingProxyType`, dataclasses `cls(**fields)` and pydantic models
 //!   `cls.model_validate(data)`.
@@ -205,19 +205,6 @@ pub fn is_cacheable(obj: &Bound<'_, PyAny>) -> bool {
     let cls = obj.get_type();
     cls.hasattr(pyo3::intern!(py, "__dataclass_fields__")).unwrap_or(false)
         || cls.hasattr(pyo3::intern!(py, "model_dump")).unwrap_or(false)
-}
-
-/// Rewrites object type ids (`map[local] = tree id`).
-pub fn remap_types(v: &mut Value, map: &[u32]) {
-    match v {
-        Value::Seq(items) => items.iter_mut().for_each(|i| remap_types(i, map)),
-        Value::Map(fields) => fields.iter_mut().for_each(|(_, i)| remap_types(i, map)),
-        Value::Object(id, fields) => {
-            *id = map[*id as usize];
-            fields.iter_mut().for_each(|(_, i)| remap_types(i, map));
-        }
-        _ => {}
-    }
 }
 
 /// Builds the read-only Python object for a value. `types[id]` resolves object type ids.

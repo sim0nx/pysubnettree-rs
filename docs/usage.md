@@ -89,7 +89,8 @@ With `value_type`, every value must be an instance of that type, or `None`. With
 supported value is accepted and type checkers see `Any`.
 
 When the same dataclass or model instance is inserted for many networks, `insert_many` converts
-it only once per call, which matters for pydantic models (`model_dump` costs ~2 µs).
+it only once per batch of 16,384 networks, which matters for pydantic models (`model_dump` costs
+~2 µs).
 
 ## Lookups
 
@@ -130,6 +131,7 @@ builder.clear()
 ```python
 tree.dump('networks.pst')                 # written atomically (temporary file + rename)
 tree = SubnetTreeRS.load('networks.pst')
+builder.dump('networks.pst')              # the same, without building a tree first
 
 data = tree.to_bytes()
 tree = SubnetTreeRS.from_bytes(data)
@@ -144,6 +146,10 @@ builder = SubnetTreeBuilder.load('networks.pst')
 Loading checks the checksum and the structure of the data and raises `ValueError` for corrupted
 or invalid input, or for values that are not of `value_type`. Trees and builders also support
 `pickle`.
+
+`dump()` streams the data into the file, so writing needs little memory beyond the tree itself.
+`build()` copies the contents of the builder (not the values, which are shared). To save a large
+tree without querying it, call `dump()` on the builder.
 
 ### Lazy values
 
@@ -164,6 +170,11 @@ validators. With lazy loading, an exception raised there is raised by the lookup
 returns the value, and again on the next attempt. Use `eager=True` to get such errors when
 loading. `SubnetTreeBuilder.load()` always builds all objects, and `to_builder()` builds the
 remaining ones.
+
+A builder also builds a value's object only when a lookup first returns it, so filling a builder
+to save it to a file does not keep an object per value. To raise errors early, `insert` and
+`insert_many` build the object of each value that contains dataclasses or models once, and drop
+it again.
 
 ## Threads
 

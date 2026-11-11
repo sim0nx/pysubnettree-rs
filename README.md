@@ -87,6 +87,8 @@ tree = SubnetTreeRS.load('routes.pst', value_type=Route)
   free-threaded Python, lookups scale with the number of threads.
 - A compact binary on-disk format with an XXH3-64 checksum. Untrusted files are fully validated,
   and classes are never imported by name from a file.
+- Repeated strings in the values (names, countries, the field names of dataclasses) are stored
+  once, in memory and on disk.
 - Works with `pickle` and with free-threaded Python (3.14t).
 - Releases the GIL while building the lookup structure and during file I/O.
 
@@ -112,7 +114,7 @@ first.
 | `has_network(network)` / `get_exact(network, default=None)` | ✓ | ✓ | Exact network match. |
 | `len(t)`, `iter(t)`, `items()` | ✓ | ✓ | Container protocol. |
 | `stats()`, `memory_usage()` | ✓ | ✓ | Sizes and approximate memory use. |
-| `to_bytes()` / `dump(path)` | ✓ | | Serialize to `bytes` or a file (written atomically). |
+| `to_bytes()` / `dump(path)` | ✓ | ✓ | Serialize to `bytes` or a file (written atomically). |
 | `from_bytes(data, value_type=None, types=())` / `load(path, ...)` | ✓ | ✓ | Deserialize, as an immutable tree or as a builder to modify it. |
 | `materialize()`, `load(..., eager=True)` | ✓ | | Build all value objects now instead of on first use (see below). |
 
@@ -124,7 +126,9 @@ type as `value_type`, and any other classes, such as nested ones, in `types`.
 
 `SubnetTreeRS.load()` validates the whole file but builds a value's Python object only when a
 lookup first returns it, so loading stays fast and small even when (almost) every network has
-its own value. Pass `eager=True`, or call `materialize()`, to build them all up front.
+its own value. Pass `eager=True`, or call `materialize()`, to build them all up front. A builder
+also builds a value's object only when a lookup first returns it. To write a large tree to a
+file, `builder.dump(path)` needs the least memory: it copies nothing.
 
 ## Performance
 
