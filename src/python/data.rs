@@ -1,25 +1,34 @@
 //! The data shared by the builder and the immutable tree, and the operations on it.
 //!
 //! The builder calls these methods while holding its lock, so they never call into Python:
-//! keys are parsed before, and results are returned as Rust values (cloning a `Py` only
-//! increments its reference count). Python objects (lists, strings, dicts) are created by the
-//! callers afterwards.
+//! keys are parsed before, and lookups return references to the stored values. The callers turn
+//! them into objects: the builder with [`ready`] (its values are always built, cloning a `Py`
+//! only increments its reference count), the immutable tree with [`Data::object`], which builds
+//! a value's object on first use (lazy loading).
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyType};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple, PyType};
 use pyo3::{PyTraverseError, PyVisit};
 
 use super::keys::Key;
 use super::values::{TypeInfo, build, classify};
 use crate::format;
 use crate::tree::{Match, Network, Tree};
-use crate::value::{DecodeError, decode as decode_value};
+use crate::value::{DecodeError, Stored, decode as decode_value, head, tag};
 
-/// The payload of a value: the read-only Python object returned by lookups.
+/// The read-only Python object of a value, returned by lookups.
 pub type Payload = Py<PyAny>;
+
+/// The tree's payload: the object of a value, built on first use. Always built in a builder.
+/// A `std` cell, not `PyOnceLock`: `__traverse__` must read it without a `Python` token.
+pub type Slot = OnceLock<Payload>;
+
+/// A stored value: its encoding and its [`Slot`].
+pub type Entry = Stored<Slot>;
 
 /// A list of `(network, value)` results, converted to Python with [`to_pairs`].
 pub type Pairs = Vec<(Network, Payload)>;
@@ -27,17 +36,18 @@ pub type Pairs = Vec<(Network, Payload)>;
 /// A tree and the classes of its registered types.
 #[derive(Default)]
 pub struct Data {
-    pub tree: Tree<Payload>,
+    pub tree: Tree<Slot>,
     /// Classes of `tree.types()`, same order.
     pub classes: Vec<TypeInfo>,
 }
 
 impl Data {
     /// An independent copy. The value objects themselves are shared (they are immutable);
-    /// copying them only increments their reference counts, it never runs Python code.
+    /// copying them only increments their reference counts, it never runs Python code. Values
+    /// not built yet are not built in the copy either.
     pub fn clone_ref(&self, py: Python<'_>) -> Self {
         Self {
-            tree: self.tree.clone_with(|p| p.clone_ref(py)),
+            tree: self.tree.clone_with(|s| s.get().map_or_else(OnceLock::new, |p| OnceLock::from(p.clone_ref(py)))),
             classes: self.classes.iter().map(|c| c.clone_ref(py)).collect(),
         }
     }
@@ -66,22 +76,20 @@ impl Data {
 
     // --- lookups: the tree must be compiled -------------------------------------------------
 
-    pub fn find(&self, py: Python<'_>, key: Key) -> Option<(Network, Payload)> {
-        let found = match key {
+    pub fn find(&self, key: Key) -> Option<Match<'_, Slot>> {
+        match key {
             Key::Addr(a) => self.tree.lookup(a),
             Key::Net(n) => self.tree.lookup_network(n),
-        };
-        found.map(|(n, p)| (n, p.clone_ref(py)))
+        }
     }
 
-    /// The payload of the longest match, the fast path of `get` and `__getitem__`.
+    /// The value of the longest match, the fast path of `get` and `__getitem__`.
     #[inline]
-    pub fn find_value(&self, py: Python<'_>, key: Key) -> Option<Payload> {
+    pub fn find_value(&self, key: Key) -> Option<&Entry> {
         match key {
             Key::Addr(a) => self.tree.lookup_value(a),
-            Key::Net(n) => self.tree.lookup_network(n).map(|(_, p)| p),
+            Key::Net(n) => self.tree.lookup_network(n).map(|(_, e)| e),
         }
-        .map(|p| p.clone_ref(py))
     }
 
     pub fn contains(&self, key: Key) -> bool {
@@ -91,12 +99,12 @@ impl Data {
         }
     }
 
-    pub fn matches(&self, py: Python<'_>, key: Key) -> Pairs {
-        snapshot(py, self.tree.matches(key.network()).into_iter())
+    pub fn matches(&self, key: Key) -> Vec<Match<'_, Slot>> {
+        self.tree.matches(key.network())
     }
 
-    pub fn entries(&self, py: Python<'_>) -> Pairs {
-        snapshot(py, self.tree.entries())
+    pub fn entries(&self) -> impl Iterator<Item = Match<'_, Slot>> {
+        self.tree.entries()
     }
 
     pub fn networks(&self) -> Vec<String> {
@@ -111,8 +119,47 @@ impl Data {
 
     // --- exact matches: work with pending mutations too ------------------------------------
 
-    pub fn get_exact(&self, py: Python<'_>, net: Network) -> Option<Payload> {
-        self.tree.get_exact(net).map(|p| p.clone_ref(py))
+    pub fn get_exact(&self, net: Network) -> Option<&Entry> {
+        self.tree.get_exact(net)
+    }
+
+    // --- value objects ---------------------------------------------------------------------
+
+    /// The object of a value, built (and cached) on first use. Never call this while holding a
+    /// lock: building runs Python code (dataclass `__init__`, pydantic validators).
+    ///
+    /// # Errors
+    /// Errors raised while building the object; they are raised again on the next attempt.
+    pub fn object(&self, py: Python<'_>, entry: &Entry) -> PyResult<Payload> {
+        if let Some(p) = entry.get() {
+            return Ok(p.clone_ref(py));
+        }
+        let value = decode_value(entry.encoded(), self.classes.len()).map_err(|e| decode_err(&e))?;
+        let obj = build(py, &value, &self.classes)?.unbind();
+        // if another thread was faster, its object wins and ours is dropped: lookups always
+        // return the same object. The closure only moves, it never blocks.
+        Ok(entry.get_or_init(|| obj).clone_ref(py))
+    }
+
+    /// `(network, object)` pairs, building objects as needed (see [`Data::object`]).
+    pub fn objects<'a>(&self, py: Python<'_>, matches: impl Iterator<Item = Match<'a, Slot>>) -> PyResult<Pairs> {
+        matches.map(|(n, e)| Ok((n, self.object(py, e)?))).collect()
+    }
+
+    /// Builds the objects of all values now.
+    ///
+    /// # Errors
+    /// The first error raised while building an object.
+    pub fn materialize(&self, py: Python<'_>) -> PyResult<()> {
+        for entry in self.tree.values() {
+            self.object(py, entry)?;
+        }
+        Ok(())
+    }
+
+    /// Number of values whose object has been built.
+    pub fn materialized(&self) -> usize {
+        self.tree.payloads().filter(|s| s.get().is_some()).count()
     }
 
     // --- serialization ---------------------------------------------------------------------
@@ -142,7 +189,7 @@ impl Data {
     }
 
     pub fn traverse(&self, visit: &PyVisit<'_>) -> Result<(), PyTraverseError> {
-        for payload in self.tree.payloads() {
+        for payload in self.tree.payloads().filter_map(OnceLock::get) {
             visit.call(payload)?;
         }
         for info in &self.classes {
@@ -152,14 +199,16 @@ impl Data {
     }
 
     /// Decodes serialized data: resolves its types against the given classes (the value type
-    /// first) and builds the payloads. The result is compiled. Not used under a lock.
+    /// first) and checks that every value is of the value type. The objects of the values are
+    /// built on first use, or now with `eager`. The result is compiled. Not used under a lock.
     pub fn decode(
         py: Python<'_>,
         data: &[u8],
         value_type: Option<&Bound<'_, PyType>>,
         types: Option<&Bound<'_, PyAny>>,
+        eager: bool,
     ) -> PyResult<Self> {
-        let tree = py.detach(|| format::decode(data)).map_err(|e| decode_err(&e))?;
+        let tree = py.detach(|| format::decode::<Slot>(data)).map_err(|e| decode_err(&e))?;
         let mut known: Vec<TypeInfo> = Vec::new();
         if let Some(cls) = value_type {
             known.extend(classify(cls)?);
@@ -179,23 +228,14 @@ impl Data {
             })?;
             classes.push(info.clone_ref(py));
         }
-        let type_count = classes.len();
-        let tree = tree.with_payloads(|_, encoded| {
-            let value = decode_value(encoded, type_count).map_err(|e| decode_err(&e))?;
-            let obj = build(py, &value, &classes)?;
-            if let Some(cls) = value_type
-                && !obj.is_none()
-                && !obj.is_instance(cls)?
-            {
-                return Err(PyValueError::new_err(format!(
-                    "the data contains a value of type {}, expected {}",
-                    obj.get_type().qualname()?,
-                    cls.qualname()?
-                )));
-            }
-            Ok::<_, PyErr>(obj.unbind())
-        })?;
-        Ok(Self { tree, classes })
+        if let Some(cls) = value_type {
+            check_value_types(py, &tree, &classes, cls)?;
+        }
+        let data = Self { tree, classes };
+        if eager {
+            data.materialize(py)?;
+        }
+        Ok(data)
     }
 
     /// Reads and decodes a file written by [`Data::dump`].
@@ -204,14 +244,69 @@ impl Data {
         path: &Path,
         value_type: Option<&Bound<'_, PyType>>,
         types: Option<&Bound<'_, PyAny>>,
+        eager: bool,
     ) -> PyResult<Self> {
         let data = py.detach(|| std::fs::read(path))?;
-        Self::decode(py, &data, value_type, types)
+        Self::decode(py, &data, value_type, types, eager)
     }
 }
 
-fn snapshot<'a>(py: Python<'_>, matches: impl Iterator<Item = Match<'a, Payload>>) -> Pairs {
-    matches.map(|(n, p)| (n, p.clone_ref(py))).collect()
+/// Checks, on the encodings, that every value's object will be an instance of `cls` (or None):
+/// the class of each kind of value is checked once with `issubclass`, which is what
+/// `isinstance` of the built object would give (`build` maps each tag to one class).
+fn check_value_types<P>(py: Python<'_>, tree: &Tree<P>, classes: &[TypeInfo], cls: &Bound<'_, PyType>) -> PyResult<()> {
+    let mapping_proxy = py.import("types")?.getattr("MappingProxyType")?.cast_into::<PyType>()?;
+    let class_of = |t: u8, id: Option<u32>| -> Bound<'_, PyType> {
+        match (t, id) {
+            (tag::FALSE | tag::TRUE, _) => py.get_type::<PyBool>(),
+            (tag::INT | tag::UINT, _) => py.get_type::<PyInt>(),
+            (tag::FLOAT, _) => py.get_type::<PyFloat>(),
+            (tag::STR, _) => py.get_type::<PyString>(),
+            (tag::BYTES, _) => py.get_type::<PyBytes>(),
+            (tag::SEQ, _) => py.get_type::<PyTuple>(),
+            (tag::OBJECT, Some(id)) => classes[id as usize].cls.bind(py).clone(),
+            _ => mapping_proxy.clone(),
+        }
+    };
+    // results per tag, and per type id for objects
+    let mut by_tag: [Option<bool>; 16] = [None; 16];
+    let mut by_type: Vec<Option<bool>> = vec![None; classes.len()];
+    for entry in tree.values() {
+        let Some((t, id)) = head(entry.encoded()) else { continue };
+        if t == tag::NULL {
+            continue;
+        }
+        let known = match id {
+            Some(id) => &mut by_type[id as usize],
+            None => &mut by_tag[usize::from(t & 0x0f)],
+        };
+        let ok = match *known {
+            Some(ok) => ok,
+            None => *known.insert(class_of(t, id).is_subclass(cls)?),
+        };
+        if !ok {
+            return Err(PyValueError::new_err(format!(
+                "the data contains a value of type {}, expected {}",
+                class_of(t, id).qualname()?,
+                cls.qualname()?
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The object of a builder's value: always built, so this never runs Python code and is safe
+/// under the builder's lock.
+///
+/// # Panics
+/// If the value has not been built (a bug: builders build every value when storing it).
+pub fn ready(py: Python<'_>, entry: &Entry) -> Payload {
+    entry.get().expect("builder values are always built").clone_ref(py)
+}
+
+/// `(network, object)` pairs of a builder, see [`ready`].
+pub fn ready_pairs<'a>(py: Python<'_>, matches: impl Iterator<Item = Match<'a, Slot>>) -> Pairs {
+    matches.map(|(n, e)| (n, ready(py, e))).collect()
 }
 
 /// Python list of `(network, value)` tuples.

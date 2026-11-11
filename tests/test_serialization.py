@@ -6,6 +6,7 @@ import pickle
 import threading
 import weakref
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -61,6 +62,83 @@ def test_invalid_and_corrupted_data():
             SubnetTreeRS.from_bytes(bytes(corrupted), types=[Route, Geo])
 
 
+def test_lazy_loading():
+    """Loaded trees build a value's object on first use and return that object from then on."""
+
+    @dataclasses.dataclass(frozen=True)
+    class Strict:
+        asn: int
+        built: ClassVar[int] = 0
+        reject: ClassVar[bool] = False
+
+        def __post_init__(self) -> None:
+            type(self).built += 1
+            if type(self).reject and self.asn < 0:
+                raise ValueError('negative asn')
+
+    b = SubnetTreeBuilder(value_type=Strict)
+    b.insert_many({f'10.{i}.0.0/16': Strict(i - 1) for i in range(64)} | {'2001:db8::/32': None})
+    data = b.build().to_bytes()
+    Strict.built = 0
+    Strict.reject = True
+
+    # nothing is built on load; the bad value only fails when it is returned
+    t = SubnetTreeRS.from_bytes(data, value_type=Strict)
+    assert Strict.built == 0
+    first = t['10.5.1.1']
+    assert Strict.built == 1
+    assert t.get('10.5.0.0/24') is first
+    assert t.lookup('10.5.1.1') == ('10.5.0.0/16', first)
+    assert t.lookup_all('10.5.1.1')[0][1] is first
+    assert t.get_exact('10.5.0.0/16') is first
+    assert t.has_network('10.0.0.0/16'), 'no object needed'
+    assert '10.0.0.1' in t
+    assert Strict.built == 1
+    assert t['2001:db8::1'] is None
+    for call in (lambda: t['10.0.0.1'], lambda: t.get('10.0.0.1'), t.items, t.materialize, t.to_builder):
+        with pytest.raises(ValueError, match='negative asn'):
+            call()
+    # errors are not cached, eager loading raises them up front
+    with pytest.raises(ValueError, match='negative asn'):
+        SubnetTreeRS.from_bytes(data, value_type=Strict, eager=True)
+    with pytest.raises(ValueError, match='negative asn'):
+        SubnetTreeBuilder.from_bytes(data, value_type=Strict)
+    Strict.reject = False
+    assert t['10.0.0.1'] == Strict(-1)
+    built = Strict.built
+    t.materialize()
+    t.materialize()
+    assert Strict.built == built + 62, 'each of the remaining values is built once'
+    assert [v for _, v in t.items()][5] is first
+    builder = t.to_builder()
+    assert builder['10.5.1.1'] is first, 'the builder shares the built objects'
+    assert SubnetTreeRS.from_bytes(data, value_type=Strict, eager=True).to_bytes() == data
+
+    # concurrent first lookups all return the same object
+    t = SubnetTreeRS.from_bytes(data, value_type=Strict)
+    barrier = threading.Barrier(8)
+    found: list[object] = []
+
+    def lookup() -> None:
+        barrier.wait()
+        found.extend(t[f'10.{i}.0.1'] for i in range(64))
+
+    threads = [threading.Thread(target=lookup) for _ in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert all(found[i] is found[i % 64] for i in range(len(found)))
+
+    # the value type is still checked on load, without building objects (bool is an int)
+    plain = SubnetTreeBuilder()
+    plain.insert_many({'10.0.0.0/8': True, '11.0.0.0/8': 7, '12.0.0.0/8': None})
+    plain_data = plain.build().to_bytes()
+    assert SubnetTreeRS.from_bytes(plain_data, value_type=int)['10.0.0.1'] is True
+    with pytest.raises(ValueError, match='type bool, expected str'):
+        SubnetTreeRS.from_bytes(plain_data, value_type=str)
+
+
 def test_concurrent_readers_and_writer():
     t = SubnetTreeBuilder()
     t.insert_many((f'10.{i}.0.0/16', i) for i in range(256))
@@ -91,18 +169,27 @@ def test_concurrent_readers_and_writer():
 
 
 def test_garbage_collection():
-    @dataclasses.dataclass(frozen=True)
-    class Node:
-        name: str
+    def cycle(kind: str) -> weakref.ref[object]:
+        @dataclasses.dataclass(frozen=True)
+        class Node:
+            name: str
 
-    # a cycle through the value class: tree -> Node instance -> Node class -> tree
-    t = SubnetTreeBuilder(value_type=Node)
-    t['10.0.0.0/8'] = Node('x')
-    Node.tree = t  # type: ignore[attr-defined]
-    ref = weakref.ref(t)
-    del t, Node
-    gc.collect()
-    assert ref() is None, 'the cycle is collected'
+        # a cycle through the value class: tree -> Node instance -> Node class -> tree
+        t = SubnetTreeBuilder(value_type=Node)
+        t['10.0.0.0/8'] = Node('x')
+        t['11.0.0.0/8'] = Node('y')
+        tree: object = t
+        if kind == 'loaded':  # one value built (it is in the cycle), the other one not
+            loaded = SubnetTreeRS.from_bytes(t.build().to_bytes(), value_type=Node)
+            assert loaded['10.0.0.1'] == Node('x')
+            tree = loaded
+        Node.tree = tree  # type: ignore[attr-defined]
+        return weakref.ref(tree)
+
+    for kind in ('builder', 'loaded'):
+        ref = cycle(kind)
+        gc.collect()
+        assert ref() is None, f'the cycle through the {kind} tree is collected'
 
 
 @pytest.mark.skipif(not SAMPLE.exists(), reason='sample data not available')

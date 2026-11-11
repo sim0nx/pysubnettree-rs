@@ -10,7 +10,7 @@ use pyo3::sync::RwLockExt;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyMapping, PyString, PyTuple, PyType};
 use pyo3::{PyTraverseError, PyVisit};
 
-use super::data::{Data, Payload, check_value_type, missing, repr, stats_dict, to_pairs};
+use super::data::{Data, Payload, Slot, check_value_type, missing, ready, ready_pairs, repr, stats_dict, to_pairs};
 use super::frozen::SubnetTreeRS;
 use super::keys::{extract_key, extract_network};
 use super::values::{Encoder, TypeInfo, build, is_cacheable, remap_types};
@@ -74,7 +74,9 @@ pub struct SubnetTreeBuilder {
 }
 
 impl SubnetTreeBuilder {
+    /// The objects of all values of `data` must be built (lookups under the lock never build).
     pub(crate) fn from_data(data: Data, value_type: Option<Py<PyType>>) -> Self {
+        debug_assert_eq!(data.materialized(), data.tree.value_count());
         Self { inner: RwLock::new(data), value_type }
     }
 
@@ -138,7 +140,7 @@ impl SubnetTreeBuilder {
         py: Python<'_>,
         local_types: &[TypeInfo],
         items: impl IntoIterator<Item = (Network, Item)>,
-    ) -> PyResult<(usize, Vec<Payload>)> {
+    ) -> PyResult<(usize, Vec<Slot>)> {
         let mut guard = self.write(py);
         let data = &mut *guard;
         let map = data.map_types(py, local_types)?;
@@ -162,7 +164,7 @@ impl SubnetTreeBuilder {
                     (blob, p.payload.clone_ref(py))
                 }
             };
-            let (new, payload) = data.tree.insert(net, blob, payload);
+            let (new, payload) = data.tree.insert(net, blob, Slot::from(payload));
             added += usize::from(new);
             unused.extend(payload);
         }
@@ -258,7 +260,7 @@ impl SubnetTreeBuilder {
     /// Removes exactly this network and returns its value. Raises KeyError if it does not exist.
     fn remove(&self, py: Python<'_>, network: &Bound<'_, PyAny>) -> PyResult<Payload> {
         let net = extract_network(network)?;
-        let removed = self.write(py).tree.remove(net).map(|p| p.clone_ref(py));
+        let removed = self.write(py).tree.remove(net).map(|e| ready(py, e));
         removed.ok_or_else(|| missing(network))
     }
 
@@ -283,7 +285,7 @@ impl SubnetTreeBuilder {
     /// Raises KeyError if there is none.
     fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Payload> {
         let k = extract_key(key)?;
-        let found = self.compiled(py).find_value(py, k);
+        let found = self.compiled(py).find_value(k).map(|e| ready(py, e));
         found.ok_or_else(|| missing(key))
     }
 
@@ -292,7 +294,7 @@ impl SubnetTreeBuilder {
     #[pyo3(signature = (key, default = None))]
     fn get(&self, py: Python<'_>, key: &Bound<'_, PyAny>, default: Option<Payload>) -> PyResult<Payload> {
         let k = extract_key(key)?;
-        let found = self.compiled(py).find_value(py, k);
+        let found = self.compiled(py).find_value(k).map(|e| ready(py, e));
         Ok(found.or(default).unwrap_or_else(|| py.None()))
     }
 
@@ -300,7 +302,7 @@ impl SubnetTreeBuilder {
     /// None if there is none.
     fn lookup(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Option<(String, Payload)>> {
         let k = extract_key(key)?;
-        let found = self.compiled(py).find(py, k);
+        let found = self.compiled(py).find(k).map(|(n, e)| (n, ready(py, e)));
         Ok(found.map(|(n, p)| (n.to_string(), p)))
     }
 
@@ -308,7 +310,7 @@ impl SubnetTreeBuilder {
     /// first.
     fn lookup_all<'py>(&self, py: Python<'py>, key: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> {
         let k = extract_key(key)?;
-        let matches = self.compiled(py).matches(py, k);
+        let matches = ready_pairs(py, self.compiled(py).matches(k).into_iter());
         to_pairs(py, matches)
     }
 
@@ -321,7 +323,7 @@ impl SubnetTreeBuilder {
     /// True if exactly this network was inserted (no longest prefix matching).
     fn has_network(&self, py: Python<'_>, network: &Bound<'_, PyAny>) -> PyResult<bool> {
         let net = extract_network(network)?;
-        Ok(self.read(py).get_exact(py, net).is_some())
+        Ok(self.read(py).get_exact(net).is_some())
     }
 
     /// Value of exactly this network (no longest prefix matching), ``default`` if it was not
@@ -329,7 +331,7 @@ impl SubnetTreeBuilder {
     #[pyo3(signature = (network, default = None))]
     fn get_exact(&self, py: Python<'_>, network: &Bound<'_, PyAny>, default: Option<Payload>) -> PyResult<Payload> {
         let net = extract_network(network)?;
-        let found = self.read(py).get_exact(py, net);
+        let found = self.read(py).get_exact(net).map(|e| ready(py, e));
         Ok(found.or(default).unwrap_or_else(|| py.None()))
     }
 
@@ -345,7 +347,7 @@ impl SubnetTreeBuilder {
 
     /// List of all ``(network, value)`` pairs (IPv4 first, sorted).
     fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let entries = self.compiled(py).entries(py);
+        let entries = ready_pairs(py, self.compiled(py).entries());
         to_pairs(py, entries)
     }
 
@@ -374,7 +376,7 @@ impl SubnetTreeBuilder {
         types: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         check_value_type(value_type.as_ref())?;
-        let decoded = Data::decode(py, data, value_type.as_ref(), types.as_ref())?;
+        let decoded = Data::decode(py, data, value_type.as_ref(), types.as_ref(), true)?;
         Ok(Self::from_data(decoded, value_type.map(Bound::unbind)))
     }
 
@@ -389,7 +391,7 @@ impl SubnetTreeBuilder {
         types: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         check_value_type(value_type.as_ref())?;
-        let decoded = Data::load(py, &path, value_type.as_ref(), types.as_ref())?;
+        let decoded = Data::load(py, &path, value_type.as_ref(), types.as_ref(), true)?;
         Ok(Self::from_data(decoded, value_type.map(Bound::unbind)))
     }
 

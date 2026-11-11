@@ -112,12 +112,17 @@ first.
 | `stats()`, `memory_usage()` | ✓ | ✓ | Sizes and approximate memory use. |
 | `to_bytes()` / `dump(path)` | ✓ | | Serialize to `bytes` or a file (written atomically). |
 | `from_bytes(data, value_type=None, types=())` / `load(path, ...)` | ✓ | ✓ | Deserialize, as an immutable tree or as a builder to modify it. |
+| `materialize()`, `load(..., eager=True)` | ✓ | | Build all value objects now instead of on first use (see below). |
 
 A lookup key can be an address or a network. For a network such as `'10.1.2.0/24'`, the result is
 the most specific stored network that contains the whole key network.
 
 When loading data that contains dataclasses or pydantic models, pass their classes: the value
 type as `value_type`, and any other classes, such as nested ones, in `types`.
+
+`SubnetTreeRS.load()` validates the whole file but builds a value's Python object only when a
+lookup first returns it, so loading stays fast and small even when (almost) every network has
+its own value. Pass `eager=True`, or call `materialize()`, to build them all up front.
 
 ## Performance
 
@@ -126,17 +131,19 @@ Full 2016 routeviews table, IPv4 and IPv6, with AS numbers as values. The table 
 reproduce it.
 
 <!-- bench:start -->
-AMD Ryzen 9 3900X 12-Core Processor, Python 3.14.5, pysubnettree-rs 0.1.0, pysubnettree 0.38.1; 1,000,000 lookups per set, median of 3 passes in each of 3 processes.
+AMD Ryzen 9 3900X 12-Core Processor, Python 3.13.5, pysubnettree-rs 0.1.0, pysubnettree 0.38.1; 1,000,000 lookups per set, median of 3 passes in each of 3 processes.
 
 | | pysubnettree-rs | [pysubnettree](https://github.com/zeek/pysubnettree) |
 |---|---:|---:|
-| Load 644,586 networks | 0.31 s | 0.35 s |
-| Lookup, addresses inside table networks | 195 ns | 1226 ns |
-| Lookup, random addresses | 132 ns | 800 ns |
+| Load 644,586 networks | 0.28 s | 0.33 s |
+| Lookup, addresses inside table networks | 165 ns | 1197 ns |
+| Lookup, random addresses | 113 ns | 768 ns |
 | of which Python loop and call overhead | 29 ns | 29 ns |
 | Memory (RSS increase) | 18 MB | 98 MB |
-| Save to file (size) | 0.012 s (4.1 MB) | n/a |
-| Load from file | 0.042 s | n/a |
+| Save to file (size) | 0.010 s (4.1 MB) | n/a |
+| Load from file | 0.030 s | n/a |
+| Load from file, a distinct dataclass per network (72 MB) | 0.163 s | n/a |
+| same, `eager=True` (builds every value object up front) | 2.137 s | n/a |
 <!-- bench:end -->
 
 ### Compared to other algorithms

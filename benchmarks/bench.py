@@ -14,6 +14,7 @@ The extension must be a release build, and uv must not rebuild it in debug mode:
 
 import argparse
 import ctypes
+import dataclasses
 import gc
 import importlib.metadata
 import importlib.util
@@ -35,6 +36,29 @@ ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_DIR = ROOT / 'sample'
 FILES = ['routeviews-rv2-20160202-1200.pfx2as', 'routeviews-rv6-20160202-1200.pfx2as']
 START, END = '<!-- bench:start -->', '<!-- bench:end -->'
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Route:
+    """A per-network value like an IP-to-AS dump built from a full BGP table has."""
+
+    asn: int
+    as_path: tuple[int, ...]
+    origin: str
+    country: str | None
+    collectors: tuple[str, ...]
+
+
+def distinct_routes(rows: list[tuple[str, str]]) -> list[tuple[str, Route]]:
+    """A distinct value for (almost) every network, deterministic."""
+    rnd = random.Random(1)
+    out = []
+    for net, _ in rows:
+        path = tuple(rnd.randrange(1, 400_000) for _ in range(rnd.randrange(3, 9)))
+        collectors = tuple(f'rrc{rnd.randrange(26):02d}' for _ in range(rnd.randrange(2, 6)))
+        route = Route(path[-1], path, rnd.choice(('IGP', 'EGP', 'INCOMPLETE')), rnd.choice(('LU', 'DE', 'US', None)), collectors)
+        out.append((net, route))
+    return out
 
 
 def rss_bytes() -> int:
@@ -120,6 +144,19 @@ def run(impl: str, lookups: int, runs: int) -> dict[str, float]:
         SubnetTreeRS.from_bytes(data)
         result['reload_s'] = time.perf_counter() - t0
         del data
+        # a distinct dataclass value per network: loading builds no objects until they are used
+        distinct = SubnetTreeBuilder(value_type=Route)
+        distinct.insert_many(distinct_routes(rows))
+        data = distinct.build().to_bytes()
+        del distinct
+        result['distinct_mb'] = len(data) / 1e6
+        for key, eager in (('distinct_lazy_s', False), ('distinct_eager_s', True)):
+            gc.collect()
+            t0 = time.perf_counter()
+            loaded = SubnetTreeRS.from_bytes(data, value_type=Route, eager=eager)
+            result[key] = time.perf_counter() - t0
+            del loaded
+        del data
     else:
         import SubnetTree as pst  # noqa: N813
 
@@ -185,6 +222,8 @@ def table(results: dict[str, dict[str, float]], lookups: int, runs: int, repeat:
         f'| Memory (RSS increase) | {cell(ours, "memory_mb", "{:.0f} MB")} | {cell(theirs, "memory_mb", "{:.0f} MB")} |',
         f'| Save to file (size) | {ours["save_s"]:.3f} s ({ours["file_mb"]:.1f} MB) | n/a |',
         f'| Load from file | {cell(ours, "reload_s", "{:.3f} s")} | n/a |',
+        f'| Load from file, a distinct dataclass per network ({ours["distinct_mb"]:.0f} MB) | {cell(ours, "distinct_lazy_s", "{:.3f} s")} | n/a |',
+        f'| same, `eager=True` (builds every value object up front) | {cell(ours, "distinct_eager_s", "{:.3f} s")} | n/a |',
     ]
     return '\n'.join(lines) + '\n'
 

@@ -102,7 +102,7 @@ pub(crate) fn err<T>(msg: impl Into<String>) -> Result<T, DecodeError> {
     Err(DecodeError(msg.into()))
 }
 
-mod tag {
+pub mod tag {
     pub const NULL: u8 = 0;
     pub const FALSE: u8 = 1;
     pub const TRUE: u8 = 2;
@@ -228,9 +228,30 @@ impl<'a> Reader<'a> {
         Ok(self.bytes(1)?[0])
     }
 
+    #[inline]
     pub fn varint(&mut self) -> Result<u128, DecodeError> {
-        let mut v = 0u128;
-        for shift in (0..128).step_by(7) {
+        // fast path: most lengths, counts and small integers take a single byte
+        if let Some(&byte) = self.data.get(self.pos)
+            && byte < 0x80
+        {
+            self.pos += 1;
+            return Ok(u128::from(byte));
+        }
+        self.varint_slow()
+    }
+
+    fn varint_slow(&mut self) -> Result<u128, DecodeError> {
+        // the first 9 bytes (63 bits) are accumulated in a u64, which is much cheaper
+        let mut low = 0u64;
+        for shift in (0..63).step_by(7) {
+            let byte = self.u8()?;
+            low |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(u128::from(low));
+            }
+        }
+        let mut v = u128::from(low);
+        for shift in (63..128).step_by(7) {
             let byte = self.u8()?;
             let bits = u128::from(byte & 0x7f);
             if shift == 126 && bits > 0b11 {
@@ -325,6 +346,70 @@ impl<'a> Reader<'a> {
             t => return err(format!("unknown value tag {t}")),
         })
     }
+
+    fn skip_str(&mut self) -> Result<(), DecodeError> {
+        let n = self.count()?;
+        let b = self.bytes(n)?;
+        // most strings are short and ASCII: `is_ascii` is much cheaper than `from_utf8` for them
+        if b.is_ascii() || std::str::from_utf8(b).is_ok() { Ok(()) } else { err("invalid UTF-8 string") }
+    }
+
+    fn skip_fields(&mut self, depth: usize, type_count: usize) -> Result<(), DecodeError> {
+        for _ in 0..self.count()? {
+            self.skip_str()?;
+            self.skip_value(depth + 1, type_count)?;
+        }
+        Ok(())
+    }
+
+    /// Validates one value exactly like [`Reader::value`] (same errors, same end position)
+    /// without building it: no allocations, used to validate whole files quickly.
+    pub fn skip_value(&mut self, depth: usize, type_count: usize) -> Result<(), DecodeError> {
+        if depth > MAX_DEPTH {
+            return err("values nested too deeply");
+        }
+        match self.u8()? {
+            tag::NULL | tag::FALSE | tag::TRUE => {}
+            tag::INT => {
+                self.u64()?;
+            }
+            tag::UINT => {
+                if i64::try_from(self.u64()?).is_ok() {
+                    return err("non-canonical integer");
+                }
+            }
+            tag::FLOAT => {
+                self.bytes(8)?;
+            }
+            tag::STR => self.skip_str()?,
+            tag::BYTES => {
+                let n = self.count()?;
+                self.bytes(n)?;
+            }
+            tag::SEQ => {
+                for _ in 0..self.count()? {
+                    self.skip_value(depth + 1, type_count)?;
+                }
+            }
+            tag::MAP => self.skip_fields(depth, type_count)?,
+            tag::OBJECT => {
+                if self.u32()? as usize >= type_count {
+                    return err("invalid type id");
+                }
+                self.skip_fields(depth, type_count)?;
+            }
+            t => return err(format!("unknown value tag {t}")),
+        }
+        Ok(())
+    }
+}
+
+/// Tag and, for objects, type id of an encoded value; `None` if the data is too short.
+#[must_use]
+pub fn head(encoded: &[u8]) -> Option<(u8, Option<u32>)> {
+    let mut r = Reader::new(encoded);
+    let t = r.u8().ok()?;
+    if t == tag::OBJECT { r.u32().ok().map(|id| (t, Some(id))) } else { Some((t, None)) }
 }
 
 /// Decodes one complete encoded value.
@@ -340,10 +425,33 @@ pub fn decode(data: &[u8], type_count: usize) -> Result<Value, DecodeError> {
     Ok(v)
 }
 
+/// A stored value: its canonical encoding and its payload. Dereferences to the payload.
+#[derive(Debug, PartialEq)]
+pub struct Stored<P> {
+    encoded: Arc<[u8]>,
+    payload: P,
+}
+
+impl<P> Stored<P> {
+    /// The canonical encoding.
+    #[must_use]
+    pub fn encoded(&self) -> &[u8] {
+        &self.encoded
+    }
+}
+
+impl<P> std::ops::Deref for Stored<P> {
+    type Target = P;
+
+    fn deref(&self) -> &P {
+        &self.payload
+    }
+}
+
 /// Deduplicating storage of encoded values and their payloads, referenced by `u32` ids.
 #[derive(Debug)]
 pub struct ValueStore<P> {
-    entries: Vec<(Arc<[u8]>, P)>,
+    entries: Vec<Stored<P>>,
     /// Lazily built index used for deduplication on insert. Dropped when not needed (e.g. after
     /// loading from disk) to save memory.
     dedup: Option<HashMap<Arc<[u8]>, u32>>,
@@ -364,6 +472,7 @@ impl<P> ValueStore<P> {
     /// Creates a store from unique encoded values and their payloads (e.g. decoded from disk).
     #[must_use]
     pub fn from_entries(entries: Vec<(Arc<[u8]>, P)>) -> Self {
+        let entries = entries.into_iter().map(|(encoded, payload)| Stored { encoded, payload }).collect();
         Self { entries, dedup: None }
     }
 
@@ -379,22 +488,36 @@ impl<P> ValueStore<P> {
 
     #[must_use]
     pub fn encoded(&self, id: u32) -> &Arc<[u8]> {
-        &self.entries[id as usize].0
+        &self.entries[id as usize].encoded
+    }
+
+    #[must_use]
+    pub fn get(&self, id: u32) -> &Stored<P> {
+        &self.entries[id as usize]
     }
 
     #[must_use]
     pub fn payload(&self, id: u32) -> &P {
-        &self.entries[id as usize].1
+        &self.entries[id as usize].payload
     }
 
     pub fn payloads(&self) -> impl Iterator<Item = &P> {
-        self.entries.iter().map(|(_, p)| p)
+        self.entries.iter().map(|e| &e.payload)
+    }
+
+    /// All stored values, in id order.
+    pub fn iter(&self) -> impl Iterator<Item = &Stored<P>> {
+        self.entries.iter()
     }
 
     /// A copy with payloads produced by `clone` (e.g. `Py::clone_ref`, Python objects are not
     /// `Clone`). The deduplication index is rebuilt lazily by the copy.
     pub fn clone_with<Q>(&self, mut clone: impl FnMut(&P) -> Q) -> ValueStore<Q> {
-        let entries = self.entries.iter().map(|(e, p)| (Arc::clone(e), clone(p))).collect();
+        let entries = self
+            .entries
+            .iter()
+            .map(|e| Stored { encoded: Arc::clone(&e.encoded), payload: clone(&e.payload) })
+            .collect();
         ValueStore { entries, dedup: None }
     }
 
@@ -408,7 +531,7 @@ impl<P> ValueStore<P> {
         self.dedup.get_or_insert_with(|| {
             // ids fit u32: `intern` never grows the store beyond u32::MAX values
             #[allow(clippy::cast_possible_truncation)]
-            entries.iter().enumerate().map(|(id, (e, _))| (Arc::clone(e), id as u32)).collect()
+            entries.iter().enumerate().map(|(id, e)| (Arc::clone(&e.encoded), id as u32)).collect()
         })
     }
 
@@ -423,7 +546,7 @@ impl<P> ValueStore<P> {
             return (id, Some(payload));
         }
         let id = u32::try_from(self.entries.len()).ok().filter(|&id| id < u32::MAX).expect("too many distinct values");
-        self.entries.push((Arc::clone(&encoded), payload));
+        self.entries.push(Stored { encoded: Arc::clone(&encoded), payload });
         self.dedup_index().insert(encoded, id);
         (id, None)
     }
@@ -440,7 +563,7 @@ impl<P> ValueStore<P> {
                 remap[id] = u32::try_from(kept.len()).expect("ids fit u32");
                 kept.push(entry);
             } else {
-                removed.push(entry.1);
+                removed.push(entry.payload);
             }
         }
         self.entries = kept;
@@ -452,8 +575,8 @@ impl<P> ValueStore<P> {
     #[must_use]
     pub fn memory_usage(&self) -> usize {
         let arc_header = 2 * size_of::<usize>();
-        let entries: usize = self.entries.iter().map(|(e, _)| arc_header + e.len()).sum();
-        let slots = self.entries.capacity() * size_of::<(Arc<[u8]>, P)>();
+        let entries: usize = self.entries.iter().map(|e| arc_header + e.encoded.len()).sum();
+        let slots = self.entries.capacity() * size_of::<Stored<P>>();
         let dedup = self.dedup.as_ref().map_or(0, |t| t.capacity() * (size_of::<(Arc<[u8]>, u32)>() + 1));
         entries + slots + dedup
     }
@@ -518,9 +641,42 @@ mod tests {
         assert!(decode(&nested(MAX_DEPTH + 1), 0).is_err());
     }
 
+    /// The allocation-free validator must accept exactly what the decoder accepts, and end at
+    /// the same position: checked for every truncation and every byte value at every position.
+    #[test]
+    fn skip_value_agrees_with_value() {
+        let mut enc = encode(&sample());
+        enc.push(tag::NULL); // a following value: the end position matters
+        let agree = |data: &[u8], types: usize| {
+            let (mut a, mut b) = (Reader::new(data), Reader::new(data));
+            let (va, vb) = (a.value(0, types), b.skip_value(0, types));
+            assert_eq!(va.is_ok(), vb.is_ok(), "{data:?}");
+            if va.is_ok() {
+                assert_eq!(a.pos, b.pos, "{data:?}");
+            }
+            usize::from(va.is_ok())
+        };
+        let mut accepted = 0;
+        for len in 0..=enc.len() {
+            accepted += agree(&enc[..len], 1);
+        }
+        for i in 0..enc.len() {
+            for byte in 0..=255u8 {
+                let mut d = enc.clone();
+                d[i] = byte;
+                accepted += agree(&d, 1) + agree(&d, 0);
+            }
+        }
+        assert!(accepted > enc.len() * 50, "both valid and invalid variants were checked");
+        assert_eq!(head(&enc), Some((tag::OBJECT, Some(0))));
+        assert_eq!(head(&[tag::STR, 0]), Some((tag::STR, None)));
+        assert_eq!(head(&[]), None);
+    }
+
     #[test]
     fn varint_roundtrip() {
-        for v in [0u128, 1, 127, 128, 300, u128::from(u64::MAX), u128::MAX] {
+        // includes the boundaries of the u64 stage (63 bits) of the multi-byte decoder
+        for v in [0u128, 1, 127, 128, 300, (1 << 63) - 1, 1 << 63, u128::from(u64::MAX), 1 << 126, u128::MAX] {
             let mut out = Vec::new();
             put_varint(&mut out, v);
             let mut r = Reader::new(&out);
@@ -528,6 +684,11 @@ mod tests {
             assert_eq!(r.remaining(), 0);
         }
         assert!(Reader::new(&[0xff; 20]).varint().is_err());
+        let mut too_big = [0xff; 19];
+        too_big[18] = 0x04; // bit 128
+        assert!(Reader::new(&too_big).varint().is_err());
+        too_big[18] = 0x03;
+        assert_eq!(Reader::new(&too_big).varint(), Ok(u128::MAX));
     }
 
     #[test]

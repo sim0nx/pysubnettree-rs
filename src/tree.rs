@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use crate::table::{Addr, PrefixTable};
-use crate::value::{TypeDesc, Value, ValueStore, encode};
+use crate::value::{Stored, TypeDesc, Value, ValueStore, encode};
 
 /// An IP network (network address with host bits cleared, prefix length).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -146,8 +146,8 @@ pub fn parse_network(s: &str) -> Result<Network, ParseError> {
     }
 }
 
-/// A matched entry: the network and the payload of its value.
-pub type Match<'a, P> = (Network, &'a P);
+/// A matched entry: the network and its value (encoding + payload, dereferences to the payload).
+pub type Match<'a, P> = (Network, &'a Stored<P>);
 
 /// IPv4 and IPv6 longest-prefix-match tables sharing a deduplicated value store.
 ///
@@ -222,6 +222,11 @@ impl<P> Tree<P> {
         self.values.payloads()
     }
 
+    /// All stored values (encoding + payload), in id order.
+    pub fn values(&self) -> impl Iterator<Item = &Stored<P>> {
+        self.values.iter()
+    }
+
     /// Id of a stored value given its encoding.
     pub fn find_value(&mut self, encoded: &[u8]) -> Option<u32> {
         self.values.find(encoded)
@@ -245,24 +250,23 @@ impl<P> Tree<P> {
         }
     }
 
-    /// Removes a network, returns the payload of its value (which stays stored until the next
-    /// compaction).
-    pub fn remove(&mut self, net: Network) -> Option<&P> {
+    /// Removes a network, returns its value (which stays stored until the next compaction).
+    pub fn remove(&mut self, net: Network) -> Option<&Stored<P>> {
         let id = match net {
             Network::V4(a, l) => self.v4.remove((a, l)),
             Network::V6(a, l) => self.v6.remove((a, l)),
         }?;
-        Some(self.values.payload(id))
+        Some(self.values.get(id))
     }
 
-    /// Payload of exactly this network (no longest prefix match). Works without compiling.
+    /// Value of exactly this network (no longest prefix match). Works without compiling.
     #[must_use]
-    pub fn get_exact(&self, net: Network) -> Option<&P> {
+    pub fn get_exact(&self, net: Network) -> Option<&Stored<P>> {
         let id = match net {
             Network::V4(a, l) => self.v4.get_exact((a, l)),
             Network::V6(a, l) => self.v6.get_exact((a, l)),
         }?;
-        Some(self.values.payload(id))
+        Some(self.values.get(id))
     }
 
     /// True if the tree needs [`Tree::compile`] before lookups.
@@ -339,12 +343,12 @@ impl<P> Tree<P> {
 
     fn match_v4(&self, id: Option<u32>) -> Option<Match<'_, P>> {
         let (a, l, v) = self.v4.entry(id?);
-        Some((Network::V4(a, l), self.values.payload(v)))
+        Some((Network::V4(a, l), self.values.get(v)))
     }
 
     fn match_v6(&self, id: Option<u32>) -> Option<Match<'_, P>> {
         let (a, l, v) = self.v6.entry(id?);
-        Some((Network::V6(a, l), self.values.payload(v)))
+        Some((Network::V6(a, l), self.values.get(v)))
     }
 
     /// Longest prefix match of an address. The tree must be compiled.
@@ -356,16 +360,16 @@ impl<P> Tree<P> {
         }
     }
 
-    /// Payload of the longest prefix match of an address, without the matched network (touches
+    /// Value of the longest prefix match of an address, without the matched network (touches
     /// less memory than [`Tree::lookup`]). The tree must be compiled.
     #[inline]
     #[must_use]
-    pub fn lookup_value(&self, addr: Address) -> Option<&P> {
+    pub fn lookup_value(&self, addr: Address) -> Option<&Stored<P>> {
         let id = match addr {
             Address::V4(a) => self.v4.lookup_value(a)?,
             Address::V6(a) => self.v6.lookup_value(a)?,
         };
-        Some(self.values.payload(id))
+        Some(self.values.get(id))
     }
 
     /// Longest prefix containing the whole network. The tree must be compiled.
@@ -397,8 +401,8 @@ impl<P> Tree<P> {
     /// All networks and their payloads: IPv4 first, each family sorted by address and prefix
     /// length. The tree must be compiled.
     pub fn entries(&self) -> impl Iterator<Item = Match<'_, P>> + '_ {
-        let v4 = self.v4.entries().map(|(a, l, v)| (Network::V4(a, l), self.values.payload(v)));
-        let v6 = self.v6.entries().map(|(a, l, v)| (Network::V6(a, l), self.values.payload(v)));
+        let v4 = self.v4.entries().map(|(a, l, v)| (Network::V4(a, l), self.values.get(v)));
+        let v6 = self.v6.entries().map(|(a, l, v)| (Network::V6(a, l), self.values.get(v)));
         v4.chain(v6)
     }
 
@@ -462,14 +466,17 @@ mod tests {
         assert!(!t.insert_value(net("2001:db8::/32"), Value::Int(2)));
         assert_eq!(t.len(), 3);
         assert_eq!(t.compile(), vec![Value::Int(1)], "the replaced value is 1 of 4 (25 %): compacted");
-        assert_eq!(t.lookup(addr("10.1.2.3")), Some((net("10.1.0.0/16"), &Value::Null)));
-        assert_eq!(t.lookup(addr("10.2.2.3")), Some((net("10.0.0.0/8"), &Value::Str("ten".into()))));
-        assert_eq!(t.lookup_value(addr("2001:db8::1")), Some(&Value::Int(2)));
-        assert_eq!(t.lookup_value(addr("::ffff:10.0.0.1")), Some(&Value::Str("ten".into())));
+        assert_eq!(t.lookup(addr("10.1.2.3")).map(|(n, v)| (n, &**v)), Some((net("10.1.0.0/16"), &Value::Null)));
+        assert_eq!(
+            t.lookup(addr("10.2.2.3")).map(|(n, v)| (n, &**v)),
+            Some((net("10.0.0.0/8"), &Value::Str("ten".into())))
+        );
+        assert_eq!(t.lookup_value(addr("2001:db8::1")).map(|v| &**v), Some(&Value::Int(2)));
+        assert_eq!(t.lookup_value(addr("::ffff:10.0.0.1")).map(|v| &**v), Some(&Value::Str("ten".into())));
         assert!(t.lookup(addr("2001:db9::1")).is_none());
         let m: Vec<_> = t.matches(net("10.1.2.3")).into_iter().map(|(n, _)| n.to_string()).collect();
         assert_eq!(m, vec!["10.1.0.0/16", "10.0.0.0/8"]);
-        assert_eq!(t.remove(net("10.1.0.0/16")), Some(&Value::Null));
+        assert_eq!(t.remove(net("10.1.0.0/16")).map(|v| &**v), Some(&Value::Null));
         assert!(t.remove(net("10.1.0.0/16")).is_none());
         let _ = t.compile();
         assert_eq!(t.lookup(addr("10.1.2.3")).unwrap().0, net("10.0.0.0/8"));
@@ -483,7 +490,7 @@ mod tests {
         assert_eq!(t.value_count(), 100);
         assert_eq!(t.compile().len(), 99);
         assert_eq!(t.value_count(), 1);
-        assert_eq!(t.lookup_value(addr("10.0.0.1")), Some(&Value::Int(99)));
+        assert_eq!(t.lookup_value(addr("10.0.0.1")).map(|v| &**v), Some(&Value::Int(99)));
         // the dedup index is consistent after compaction
         assert_eq!(t.find_value(&encode(&Value::Int(99))), Some(0));
         t.insert_value(net("11.0.0.0/8"), Value::Int(99));
@@ -497,8 +504,8 @@ mod tests {
         let _ = t.compile();
         assert_eq!(t.len(), 2);
         assert_eq!(copy.len(), 2);
-        assert_eq!(t.lookup_value(addr("10.0.0.1")), Some(&Value::Int(99)));
-        assert_eq!(copy.lookup_value(addr("10.0.0.1")), None);
-        assert_eq!(copy.lookup_value(addr("12.0.0.1")), Some(&Value::Int(5)));
+        assert_eq!(t.lookup_value(addr("10.0.0.1")).map(|v| &**v), Some(&Value::Int(99)));
+        assert_eq!(copy.lookup_value(addr("10.0.0.1")).map(|v| &**v), None);
+        assert_eq!(copy.lookup_value(addr("12.0.0.1")).map(|v| &**v), Some(&Value::Int(5)));
     }
 }

@@ -60,12 +60,21 @@ Each distinct value is stored once, as two things:
   and it is written to disk as-is.
 - one **read-only Python object**, built from the encoding. Lookups return it directly. Building
   it from the encoding means a lookup returns the same thing whether the tree was filled by
-  inserts or loaded from disk.
+  inserts or loaded from disk. It lives in a once-cell (`std::sync::OnceLock`) next to the
+  encoding: a builder fills it when storing the value, a loaded `SubnetTreeRS` when a lookup
+  first returns the value. Concurrent first lookups may both build an object; the first one
+  stored wins and is returned to everyone, the other one is dropped. Building happens outside
+  any lock and is not cached when it fails.
 
 Networks reference values by `u32` id. The Rust core is generic over the payload: `Tree<P>`
 holds the Python object in the bindings and `()` after decoding a file. Dataclasses and pydantic
 models are encoded as objects that reference a type table. The file stores only the kind and the
 qualified name of each type, and `load()` resolves names against the classes passed in.
+
+Loading validates every value without building it (an allocation-free walk over the encoding),
+rejects duplicates by sorting seeded xxh3 hashes, and checks `value_type` on the encodings: the
+class that each kind of encoded value turns into (one per tag, or the object's type) is checked
+once with `issubclass`.
 
 The deduplication index is built lazily: a tree loaded from disk does not keep it until the next
 insert. Values that are no longer referenced are dropped when at least a quarter of all values

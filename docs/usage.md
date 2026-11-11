@@ -142,7 +142,28 @@ builder = SubnetTreeBuilder.load('networks.pst')
 ```
 
 Loading checks the checksum and the structure of the data and raises `ValueError` for corrupted
-or invalid input. Trees and builders also support `pickle`.
+or invalid input, or for values that are not of `value_type`. Trees and builders also support
+`pickle`.
+
+### Lazy values
+
+`SubnetTreeRS.load()` and `from_bytes()` do not build the Python objects of the values. A
+value's object is built when a lookup first returns it, and the same object is returned from
+then on (also when several threads ask for it at the same time). For a file where (almost) every
+network has its own value, such as an IP-to-AS table built from a full BGP dump, this makes
+loading more than 10× faster and saves the memory of all values that are never looked up:
+
+```python
+tree = SubnetTreeRS.load('ip2as.pst', value_type=Route)                # fast, nothing built yet
+tree = SubnetTreeRS.load('ip2as.pst', value_type=Route, eager=True)    # builds all objects now
+tree.materialize()                                                     # the same, later
+```
+
+Building an object runs Python code: the dataclass `__init__` and `__post_init__`, or pydantic
+validators. With lazy loading, an exception raised there is raised by the lookup that first
+returns the value, and again on the next attempt. Use `eager=True` to get such errors when
+loading. `SubnetTreeBuilder.load()` always builds all objects, and `to_builder()` builds the
+remaining ones.
 
 ## Threads
 

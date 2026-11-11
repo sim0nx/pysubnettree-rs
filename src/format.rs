@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
 use crate::table::{Addr, PrefixTable};
 use crate::tree::Tree;
@@ -101,12 +101,26 @@ fn decode_table<A: Addr>(r: &mut Reader<'_>, value_count: usize) -> Result<Prefi
     PrefixTable::from_sorted(entries).map_err(DecodeError)
 }
 
-/// Deserializes a tree, validating the data. Payloads are empty; attach them with
-/// [`Tree::with_payloads`] (the decoded values are available via [`Tree::encoded`]).
+/// True if two of the byte ranges `body[start..end]` are equal. Sorts seeded xxh3 hashes and
+/// compares bytes only where hashes are equal; the random seed keeps crafted collisions (and so
+/// quadratic behaviour) out of reach. Several times faster than a `HashSet` of slices.
+fn has_duplicates(body: &[u8], ranges: &[(usize, usize)]) -> bool {
+    let seed = std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), 0u8);
+    let bytes = |i: usize| &body[ranges[i].0..ranges[i].1];
+    let mut hashes: Vec<(u64, usize)> = (0..ranges.len()).map(|i| (xxh3_64_with_seed(bytes(i), seed), i)).collect();
+    hashes.sort_unstable();
+    hashes
+        .chunk_by(|x, y| x.0 == y.0)
+        .any(|run| run.iter().enumerate().any(|(k, &(_, i))| run[k + 1..].iter().any(|&(_, j)| bytes(i) == bytes(j))))
+}
+
+/// Deserializes a tree, validating the data. Payloads are `P::default()` (e.g. empty cells
+/// filled on first use); [`Tree::with_payloads`] replaces them (the values are available via
+/// [`Tree::encoded`]).
 ///
 /// # Errors
 /// If the data is not a valid, uncorrupted tree of a supported version.
-pub fn decode(data: &[u8]) -> Result<Tree<()>, DecodeError> {
+pub fn decode<P: Default>(data: &[u8]) -> Result<Tree<P>, DecodeError> {
     if data.len() < HEADER_LEN + CHECKSUM_LEN || &data[..MAGIC.len()] != MAGIC {
         return err("not a subnet tree file");
     }
@@ -138,18 +152,18 @@ pub fn decode(data: &[u8]) -> Result<Tree<()>, DecodeError> {
         types.push(desc);
     }
 
+    // validate without building the values, keep their positions
     let n = r.count()?;
-    let mut values = Vec::with_capacity(n);
-    let mut seen = std::collections::HashSet::with_capacity(n);
+    let mut ranges = Vec::with_capacity(n);
     for _ in 0..n {
         let start = r.pos;
-        r.value(0, types.len())?;
-        let encoded: Arc<[u8]> = Arc::from(&body[start..r.pos]);
-        if !seen.insert(Arc::clone(&encoded)) {
-            return err("duplicate value");
-        }
-        values.push((encoded, ()));
+        r.skip_value(0, types.len())?;
+        ranges.push((start, r.pos));
     }
+    if has_duplicates(body, &ranges) {
+        return err("duplicate value");
+    }
+    let values: Vec<_> = ranges.into_iter().map(|(a, b)| (Arc::from(&body[a..b]), P::default())).collect();
     let v4 = decode_table::<u32>(&mut r, values.len())?;
     let v6 = decode_table::<u128>(&mut r, values.len())?;
     if r.remaining() != 0 {
@@ -157,7 +171,7 @@ pub fn decode(data: &[u8]) -> Result<Tree<()>, DecodeError> {
     }
     let mut tree = Tree { v4, v6, values: ValueStore::from_entries(values), types };
     // a hand-crafted file may contain unreferenced values, harmless but a waste of memory
-    let _: Vec<()> = tree.compact_values(true);
+    drop(tree.compact_values(true));
     Ok(tree)
 }
 
@@ -190,7 +204,7 @@ mod tests {
     }
 
     fn load(data: &[u8]) -> Result<Tree<Value>, DecodeError> {
-        let t = decode(data)?;
+        let t = decode::<()>(data)?;
         let types = t.types().len();
         t.with_payloads(|_, encoded| decode_value(encoded, types))
     }
@@ -201,8 +215,8 @@ mod tests {
         let data = encode(&t);
         let t2 = load(&data).unwrap();
         assert_eq!(t2.types(), t.types());
-        let a: Vec<(Network, &Value)> = t.entries().collect();
-        let b: Vec<(Network, &Value)> = t2.entries().collect();
+        let a: Vec<(Network, &Value)> = t.entries().map(|(n, v)| (n, &**v)).collect();
+        let b: Vec<(Network, &Value)> = t2.entries().map(|(n, v)| (n, &**v)).collect();
         assert_eq!(a, b);
         // the unreferenced Int(1) was not written, re-encoding is deterministic
         assert_eq!(t2.value_count(), 5);
@@ -213,13 +227,13 @@ mod tests {
     #[test]
     fn rejects_corruption() {
         let data = encode(&sample());
-        assert!(decode(&data[..data.len() - 1]).is_err());
-        assert!(decode(b"").is_err());
-        assert!(decode(b"PYSTREE\0garbage!garbage").is_err());
+        assert!(decode::<()>(&data[..data.len() - 1]).is_err());
+        assert!(decode::<()>(b"").is_err());
+        assert!(decode::<()>(b"PYSTREE\0garbage!garbage").is_err());
         for i in 0..data.len() {
             let mut d = data.clone();
             d[i] ^= 0x10;
-            assert!(decode(&d).is_err(), "flipped byte {i} not detected");
+            assert!(decode::<()>(&d).is_err(), "flipped byte {i} not detected");
         }
     }
 
@@ -252,7 +266,7 @@ mod tests {
             data.extend_from_slice(body);
             let checksum = xxh3_64(&data);
             data.extend_from_slice(&checksum.to_le_bytes());
-            assert!(decode(&data).is_err(), "{name} not rejected");
+            assert!(decode::<()>(&data).is_err(), "{name} not rejected");
         }
     }
 }
