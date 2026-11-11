@@ -131,7 +131,7 @@ Full 2016 routeviews table, IPv4 and IPv6, with AS numbers as values. The table 
 reproduce it.
 
 <!-- bench:start -->
-AMD Ryzen 9 3900X 12-Core Processor, Python 3.13.5, pysubnettree-rs 0.1.0, pysubnettree 0.38.1; 1,000,000 lookups per set, median of 3 passes in each of 3 processes.
+AMD Ryzen 9 3900X 12-Core Processor, Python 3.13.5, pysubnettree-rs 0.2.0, pysubnettree 0.38.1; 1,000,000 lookups per set, median of 3 passes in each of 3 processes.
 
 | | pysubnettree-rs | [pysubnettree](https://github.com/zeek/pysubnettree) |
 |---|---:|---:|
