@@ -1,5 +1,3 @@
-target/
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 .pytest_cache/
@@ -86,3 +84,9 @@ target/
 # coverage
 coverage.lcov
 *.profraw
+
+# uv
+uv.lock
+
+# local notes
+/TODO.md
