@@ -18,7 +18,7 @@ checksum = "1ba316f62b8c533e3e40a318466a7aa4ac8be6beae5c358a564675d36a8d84c2"
 
 [[package]]
 name = "pysubnettree-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "xxhash-rust",
 ]
