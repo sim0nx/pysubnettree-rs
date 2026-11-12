@@ -1,6 +1,6 @@
 [package]
 name = "pysubnettree-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Fast, memory-efficient longest-prefix-match lookups of IPv4/IPv6 subnets for Python"
