@@ -76,8 +76,9 @@ tree = SubnetTreeRS.load('routes.pst', value_type=Route)
 - Keys can be `str` (`'10.0.0.0/8'`, `'10.1.2.3'`), packed `bytes` (4 or 16 bytes), or
   `ipaddress` address and network objects.
 - Values can be `None`, `bool`, `int` (64 bit), `float`, `str`, `bytes`, `list`/`tuple`, `dict`
-  with `str` keys, frozen dataclasses, and frozen pydantic models, nested in any combination.
-  Every supported value can be saved to disk without `pickle`.
+  with `str` keys, enum members, frozen dataclasses, and frozen pydantic models, nested in any
+  combination. Every supported value can be saved to disk without `pickle`, and comes back as
+  what was inserted: types that could not be restored, such as `namedtuple`, are rejected.
 - Values are read-only. Lookups return immutable objects: `list` and `tuple` come back as
   `tuple`, and `dict` as `types.MappingProxyType`. Equal values are stored once and returned as
   the same object, with no copying or conversion per lookup.
@@ -121,8 +122,8 @@ first.
 A lookup key can be an address or a network. For a network such as `'10.1.2.0/24'`, the result is
 the most specific stored network that contains the whole key network.
 
-When loading data that contains dataclasses or pydantic models, pass their classes: the value
-type as `value_type`, and any other classes, such as nested ones, in `types`.
+When loading data that contains dataclasses, pydantic models or enums, pass their classes: the
+value type as `value_type`, and any other classes, such as nested ones, in `types`.
 
 `SubnetTreeRS.load()` validates the whole file but builds a value's Python object only when a
 lookup first returns it, so loading stays fast and small even when (almost) every network has

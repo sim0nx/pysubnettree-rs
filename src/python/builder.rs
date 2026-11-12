@@ -38,7 +38,7 @@ enum Item {
 
 fn has_objects(v: &Value) -> bool {
     match v {
-        Value::Object(..) => true,
+        Value::Object(..) | Value::Enum(..) => true,
         Value::Seq(items) => items.iter().any(has_objects),
         Value::Map(fields) => fields.iter().any(|(_, v)| has_objects(v)),
         _ => false,

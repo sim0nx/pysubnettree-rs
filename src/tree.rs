@@ -237,7 +237,7 @@ impl<P> Tree<P> {
     /// What the encoded values refer to, to decode them.
     #[must_use]
     pub fn refs(&self) -> Refs<'_> {
-        Refs { types: self.types.len(), strings: self.strings.strings() }
+        Refs { types: &self.types, strings: self.strings.strings() }
     }
 
     /// Encodes a value for this tree, adding its strings. `types`, if given, maps the object
@@ -359,7 +359,7 @@ impl<P> Tree<P> {
     /// quarter is unused. The values are encoded again with the new string ids.
     fn compact_strings(&mut self, force: bool) {
         let strings = self.strings.strings();
-        let types = self.types.len();
+        let types = &self.types;
         let mut used = vec![false; strings.len()];
         for v in self.values.iter() {
             visit_strings(v.encoded(), types, |id| used[id as usize] = true);

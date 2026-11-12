@@ -97,8 +97,13 @@ checks the store's *epoch*, which changes whenever ids change, before storing th
 
 Networks reference values by `u32` id. The Rust core is generic over the payload: `Tree<P>`
 holds the Python object in the bindings and `()` after decoding a file. Dataclasses and pydantic
-models are encoded as objects that reference a type table. The file stores only the kind and the
-qualified name of each type, and `load()` resolves names against the classes passed in.
+models are encoded as objects that reference a type table, enum members as their value and a
+reference to their enum. The file stores only the kind and the qualified name of each type, and
+`load()` resolves names against the classes passed in.
+
+Only exact built-in types are accepted (`str`, not a subclass of it), besides enums and these
+registered types: a value always comes back as what was inserted. A `StrEnum` member used to be
+stored as its `str` value, which a dataclass then got back instead of the member.
 
 Loading validates every value without building it (a walk over the encoding that copies it in
 canonical form), rejects duplicate values and strings by sorting seeded xxh3 hashes, and checks `value_type` on the encodings: the

@@ -25,9 +25,7 @@
 //! | 8   | sequence | varint count, values                                          |
 //! | 9   | mapping  | varint count, (varint key string id, value) pairs             |
 //! | 10  | object   | varint type id, varint count, (key, value) pairs as for 9     |
-//!
-//! Version 1 files stored strings inline (varint byte length, UTF-8) instead of string ids; they
-//! are converted when loaded (see [`Reader::transcode`]).
+//! | 11  | enum     | varint type id, the member's value                            |
 
 use std::fmt;
 use std::sync::Arc;
@@ -61,6 +59,8 @@ pub enum Value {
     Map(Fields),
     /// An instance of a registered type (dataclass, pydantic model), see [`TypeDesc`].
     Object(u32, Fields),
+    /// A member of a registered enum type, given by its value.
+    Enum(u32, Box<Value>),
 }
 
 impl Value {
@@ -79,6 +79,8 @@ pub enum TypeKind {
     Dataclass = 1,
     /// Rebuilt with `cls.model_validate(fields)`.
     Pydantic = 2,
+    /// An enum; members are restored with `cls(value)`.
+    Enum = 3,
 }
 
 impl TypeKind {
@@ -87,6 +89,7 @@ impl TypeKind {
         match v {
             1 => Some(Self::Dataclass),
             2 => Some(Self::Pydantic),
+            3 => Some(Self::Enum),
             _ => None,
         }
     }
@@ -127,6 +130,7 @@ pub mod tag {
     pub const SEQ: u8 = 8;
     pub const MAP: u8 = 9;
     pub const OBJECT: u8 = 10;
+    pub const ENUM: u8 = 11;
 }
 
 /// Destination of encoded data: a `Vec<u8>`, or [`Discard`] to only validate.
@@ -244,6 +248,12 @@ impl<F: FnMut(&str) -> u32> Encoder<'_, F> {
                 put_varint(out, u128::from(id));
                 self.fields(fields);
             }
+            Value::Enum(type_id, value) => {
+                out.push(tag::ENUM);
+                let id = self.types.map_or(*type_id, |map| map[*type_id as usize]);
+                put_varint(out, u128::from(id));
+                self.value(value);
+            }
         }
     }
 }
@@ -256,11 +266,20 @@ pub fn encode(v: &Value, types: Option<&[u32]>, intern: impl FnMut(&str) -> u32)
     encoder.out
 }
 
-/// What encoded values refer to: the number of registered types and the strings.
+/// What encoded values refer to: the registered types and the strings.
 #[derive(Debug, Clone, Copy)]
 pub struct Refs<'a> {
-    pub types: usize,
+    pub types: &'a [TypeDesc],
     pub strings: &'a Strings,
+}
+
+/// Checks that a type id exists and refers to an enum (`enum_`) or to an object type.
+fn check_type(types: &[TypeDesc], id: u32, enum_: bool) -> Result<(), DecodeError> {
+    match types.get(id as usize) {
+        Some(t) if (t.kind == TypeKind::Enum) == enum_ => Ok(()),
+        Some(_) => err(if enum_ { "enum of a type which is not an enum" } else { "object of an enum type" }),
+        None => err("invalid type id"),
+    }
 }
 
 /// Sequential reader of encoded data with bounds checks.
@@ -411,10 +430,13 @@ impl<'a> Reader<'a> {
             tag::MAP => Value::Map(self.fields(depth, refs)?),
             tag::OBJECT => {
                 let type_id = self.u32()?;
-                if type_id as usize >= refs.types {
-                    return err("invalid type id");
-                }
+                check_type(refs.types, type_id, false)?;
                 Value::Object(type_id, self.fields(depth, refs)?)
+            }
+            tag::ENUM => {
+                let type_id = self.u32()?;
+                check_type(refs.types, type_id, true)?;
+                Value::Enum(type_id, Box::new(self.value(depth + 1, refs)?))
             }
             t => return err(format!("unknown value tag {t}")),
         })
@@ -424,7 +446,7 @@ impl<'a> Reader<'a> {
         &mut self,
         out: &mut S,
         depth: usize,
-        types: usize,
+        types: &[TypeDesc],
         string: &mut F,
     ) -> Result<(), DecodeError>
     where
@@ -443,12 +465,12 @@ impl<'a> Reader<'a> {
     /// Validates one value exactly like [`Reader::value`] (same errors, same end position), and
     /// writes it to `out` in canonical form, without building it. `string` reads a string (an
     /// id, or an inline string in version 1 data) and returns the id to write: it validates
-    /// and maps the ids. `types` is the number of registered types.
+    /// and maps the ids. `types` are the registered types.
     pub fn transcode<S: Sink, F>(
         &mut self,
         out: &mut S,
         depth: usize,
-        types: usize,
+        types: &[TypeDesc],
         string: &mut F,
     ) -> Result<(), DecodeError>
     where
@@ -489,11 +511,15 @@ impl<'a> Reader<'a> {
             tag::MAP => self.transcode_fields(out, depth, types, string)?,
             tag::OBJECT => {
                 let id = self.u32()?;
-                if id as usize >= types {
-                    return err("invalid type id");
-                }
+                check_type(types, id, false)?;
                 out.varint(u128::from(id));
                 self.transcode_fields(out, depth, types, string)?;
+            }
+            tag::ENUM => {
+                let id = self.u32()?;
+                check_type(types, id, true)?;
+                out.varint(u128::from(id));
+                self.transcode(out, depth + 1, types, string)?;
             }
             t => return err(format!("unknown value tag {t}")),
         }
@@ -501,12 +527,13 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Tag and, for objects, type id of an encoded value; `None` if the data is too short.
+/// Tag and, for objects and enums, type id of an encoded value; `None` if the data is too
+/// short.
 #[must_use]
 pub fn head(encoded: &[u8]) -> Option<(u8, Option<u32>)> {
     let mut r = Reader::new(encoded);
     let t = r.u8().ok()?;
-    if t == tag::OBJECT { r.u32().ok().map(|id| (t, Some(id))) } else { Some((t, None)) }
+    if matches!(t, tag::OBJECT | tag::ENUM) { r.u32().ok().map(|id| (t, Some(id))) } else { Some((t, None)) }
 }
 
 /// Decodes one complete encoded value.
@@ -523,13 +550,13 @@ pub fn decode(data: &[u8], refs: Refs<'_>) -> Result<Value, DecodeError> {
 }
 
 /// Writes a valid encoded value to `out` with its string ids mapped by `map`.
-pub(crate) fn remap_strings(encoded: &[u8], out: &mut Vec<u8>, types: usize, mut map: impl FnMut(u32) -> u32) {
+pub(crate) fn remap_strings(encoded: &[u8], out: &mut Vec<u8>, types: &[TypeDesc], mut map: impl FnMut(u32) -> u32) {
     let mut string = |r: &mut Reader<'_>| r.u32().map(&mut map);
     Reader::new(encoded).transcode(out, 0, types, &mut string).expect("a valid encoded value");
 }
 
 /// Calls `f` with every string id of a valid encoded value, in order.
-pub(crate) fn visit_strings(encoded: &[u8], types: usize, mut f: impl FnMut(u32)) {
+pub(crate) fn visit_strings(encoded: &[u8], types: &[TypeDesc], mut f: impl FnMut(u32)) {
     let mut string = |r: &mut Reader<'_>| r.u32().inspect(|&id| f(id));
     Reader::new(encoded).transcode(&mut Discard, 0, types, &mut string).expect("a valid encoded value");
 }
@@ -833,8 +860,13 @@ mod tests {
     use crate::strings::StringSet;
 
     fn sample() -> Value {
+        sample_with(0, 1)
+    }
+
+    /// [`sample`] with other type ids for the object and the enum.
+    fn sample_with(object: u32, enum_: u32) -> Value {
         Value::Object(
-            0,
+            object,
             vec![
                 ("int".into(), Value::Int(-15169)),
                 ("big".into(), Value::UInt(u64::MAX)),
@@ -844,6 +876,7 @@ mod tests {
                 ("seq".into(), Value::Seq(vec![Value::Bool(true), Value::Bool(false), Value::Null].into())),
                 ("map".into(), Value::Map(vec![("s".into(), Value::Str("ünïcode".into()))].into())),
                 ("again".into(), Value::Str("ünïcode".into())),
+                ("kind".into(), Value::Enum(enum_, Box::new(Value::Str("ünïcode".into())))),
             ]
             .into(),
         )
@@ -853,7 +886,15 @@ mod tests {
         encode(v, None, |s| set.intern(s))
     }
 
-    fn refs(set: &StringSet, types: usize) -> Refs<'_> {
+    /// The types of [`sample`]: a dataclass (0) and an enum (1).
+    fn types() -> Vec<TypeDesc> {
+        vec![
+            TypeDesc { kind: TypeKind::Dataclass, name: "mod.Route".into() },
+            TypeDesc { kind: TypeKind::Enum, name: "mod.Kind".into() },
+        ]
+    }
+
+    fn refs<'a>(set: &'a StringSet, types: &'a [TypeDesc]) -> Refs<'a> {
         Refs { types, strings: set.strings() }
     }
 
@@ -862,14 +903,14 @@ mod tests {
         let mut set = StringSet::default();
         let v = sample();
         let e = enc(&mut set, &v);
-        assert_eq!(decode(&e, refs(&set, 1)).unwrap(), v);
+        let types = types();
+        assert_eq!(decode(&e, refs(&set, &types)).unwrap(), v);
         // strings are stored once
-        assert_eq!(set.strings().len(), 10);
+        assert_eq!(set.strings().len(), 11);
         assert_eq!(set.strings().get(9), Some("again"));
         // canonical: the same value encodes the same way, with mapped type ids too
         assert_eq!(enc(&mut set, &v), e);
-        let Value::Object(_, fields) = &v else { unreachable!() };
-        let mapped = encode(&Value::Object(1, fields.clone()), Some(&[7, 0]), |s| set.intern(s));
+        let mapped = encode(&sample_with(1, 0), Some(&[1, 0]), |s| set.intern(s));
         assert_eq!(mapped, e);
         // type-exact: values Python considers equal encode differently
         let ints = [Value::Int(1), Value::Float(1.0), Value::Bool(true)].map(|v| enc(&mut set, &v));
@@ -878,24 +919,28 @@ mod tests {
         assert_eq!(Value::from_u64(u64::MAX), Value::UInt(u64::MAX));
         // renumbering strings
         let mut ids = Vec::new();
-        visit_strings(&e, 1, |id| ids.push(id));
-        assert_eq!(ids, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 8]);
+        visit_strings(&e, &types, |id| ids.push(id));
+        assert_eq!(ids, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 8, 10, 8]);
         let mut reversed = Vec::new();
-        remap_strings(&e, &mut reversed, 1, |id| 9 - id);
+        remap_strings(&e, &mut reversed, &types, |id| 10 - id);
         let mut strings = Strings::new();
         for s in set.strings().iter().collect::<Vec<_>>().into_iter().rev() {
             strings.push(s);
         }
-        assert_eq!(decode(&reversed, Refs { types: 1, strings: &strings }).unwrap(), v);
+        assert_eq!(decode(&reversed, Refs { types: &types, strings: &strings }).unwrap(), v);
     }
 
     #[test]
     fn decode_rejects_invalid() {
         let mut set = StringSet::default();
         let e = enc(&mut set, &sample());
-        assert!(decode(&e, refs(&set, 0)).is_err(), "type id out of range");
+        let types = types();
+        assert!(decode(&e, refs(&set, &types[..1])).is_err(), "type id out of range");
+        let swapped = [types[1].clone(), types[0].clone()];
+        assert!(decode(&e, refs(&set, &swapped)).is_err(), "object of an enum type");
+        assert!(decode(&enc(&mut set, &sample_with(0, 0)), refs(&set, &types)).is_err(), "enum of a dataclass");
         for len in 0..e.len() {
-            assert!(decode(&e[..len], refs(&set, 1)).is_err(), "truncated at {len}");
+            assert!(decode(&e[..len], refs(&set, &types)).is_err(), "truncated at {len}");
         }
         let cases: &[&[u8]] = &[
             &[42],                                                                         // unknown tag
@@ -907,15 +952,15 @@ mod tests {
             &[tag::INT, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f], // > u64
         ];
         for case in cases {
-            assert!(decode(case, refs(&set, 1)).is_err(), "{case:?}");
+            assert!(decode(case, refs(&set, &types)).is_err(), "{case:?}");
         }
         let nested = |depth: usize| {
             let mut d: Vec<u8> = std::iter::repeat_n([tag::SEQ, 1], depth).flatten().collect();
             d.push(tag::NULL);
             d
         };
-        assert!(decode(&nested(MAX_DEPTH), refs(&set, 0)).is_ok());
-        assert!(decode(&nested(MAX_DEPTH + 1), refs(&set, 0)).is_err());
+        assert!(decode(&nested(MAX_DEPTH), refs(&set, &[])).is_ok());
+        assert!(decode(&nested(MAX_DEPTH + 1), refs(&set, &[])).is_err());
     }
 
     /// The allocation-free validator must accept exactly what the decoder accepts, end at the
@@ -927,7 +972,9 @@ mod tests {
         let mut e = enc(&mut set, &sample());
         e.push(tag::NULL); // a following value: the end position matters
         let strings = set.strings();
-        let agree = |data: &[u8], types: usize| {
+        let types = types();
+        let swapped = [types[1].clone(), types[0].clone()];
+        let agree = |data: &[u8], types: &[TypeDesc]| {
             let (mut a, mut b) = (Reader::new(data), Reader::new(data));
             let mut out = Vec::new();
             let mut string = |r: &mut Reader<'_>| {
@@ -948,17 +995,17 @@ mod tests {
         // a canonical value is copied unchanged
         let mut out = Vec::new();
         let mut string = |r: &mut Reader<'_>| r.u32();
-        Reader::new(&e).transcode(&mut out, 0, 1, &mut string).unwrap();
+        Reader::new(&e).transcode(&mut out, 0, &types, &mut string).unwrap();
         assert_eq!(out, e[..e.len() - 1]);
         let mut accepted = 0;
         for len in 0..=e.len() {
-            accepted += agree(&e[..len], 1);
+            accepted += agree(&e[..len], &types);
         }
         for i in 0..e.len() {
             for byte in 0..=255u8 {
                 let mut d = e.clone();
                 d[i] = byte;
-                accepted += agree(&d, 1) + agree(&d, 0);
+                accepted += agree(&d, &types) + agree(&d, &types[..1]) + agree(&d, &swapped);
             }
         }
         assert!(accepted > e.len() * 50, "both valid and invalid variants were checked");
@@ -967,19 +1014,17 @@ mod tests {
         assert_eq!(head(&[]), None);
     }
 
-    /// Version 1 data (inline strings) is converted to string ids.
     #[test]
-    fn transcode_inline_strings() {
-        let v1: &[u8] = &[tag::MAP, 2, 1, b'a', tag::STR, 2, b'h', b'i', 1, b'b', tag::STR, 1, b'a'];
+    fn enums() {
         let mut set = StringSet::default();
-        let mut out = Vec::new();
-        let mut string = |r: &mut Reader<'_>| r.str().map(|s| set.intern(s));
-        Reader::new(v1).transcode(&mut out, 0, 0, &mut string).unwrap();
-        assert_eq!(out, [tag::MAP, 2, 0, tag::STR, 1, 2, tag::STR, 0]);
-        let map = Value::Map(vec![("a".into(), Value::Str("hi".into())), ("b".into(), Value::Str("a".into()))].into());
-        assert_eq!(decode(&out, refs(&set, 0)).unwrap(), map);
-        let mut string = |r: &mut Reader<'_>| r.str().map(|_| 0);
-        assert!(Reader::new(&[tag::STR, 1, 0xff]).transcode(&mut Discard, 0, 0, &mut string).is_err(), "invalid UTF-8");
+        let types = types();
+        let member = Value::Enum(1, Box::new(Value::Int(3)));
+        let e = enc(&mut set, &member);
+        assert_eq!(e, [tag::ENUM, 1, tag::INT, 6]);
+        assert_eq!(head(&e), Some((tag::ENUM, Some(1))));
+        assert_eq!(decode(&e, refs(&set, &types)).unwrap(), member);
+        assert_ne!(e, enc(&mut set, &Value::Int(3)), "a member is not its value");
+        assert!(decode(&[tag::ENUM, 1], refs(&set, &types)).is_err(), "no value");
     }
 
     #[test]

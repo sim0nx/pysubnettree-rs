@@ -1,7 +1,6 @@
 """Files, bytes and corruption handling."""
 
 import dataclasses
-import datetime as dt
 import gc
 import pickle
 import threading
@@ -11,10 +10,9 @@ from typing import ClassVar
 
 import pytest
 
-import pysubnettree_rs
 from pysubnettree_rs import SubnetTreeBuilder, SubnetTreeRS
 
-from .conftest import Geo, Model, Owner, Route
+from .conftest import Geo, Route
 
 SAMPLE = Path(__file__).parent.parent / 'sample' / 'routeviews-rv6-20160202-1200.pfx2as'
 
@@ -299,43 +297,3 @@ def test_builder_builds_objects_lazily():
         b.insert_many([('13.0.0.0/8', negative)])
     Counted.reject = False
     assert '13.0.0.1' not in b
-
-
-DATA = Path(__file__).parent / 'data'
-
-
-def format_v1_items() -> dict[str, object]:
-    """The contents of ``data/format_v1.pst``, written by version 0.2.0 (file format 1)."""
-    items: dict[str, object] = {
-        '0.0.0.0/0': None,
-        '10.0.0.0/8': 'ten',
-        '10.1.0.0/16': {'name': 'office', 'tags': ['a', 'b'], 'nested': {'ten': 'ten'}},
-        '10.2.0.0/16': ['ten', 'ünïcode ✓', '', b'\x00bytes', 1.5, True, False, -(2**63), 2**64 - 1],
-        '10.3.0.0/16': Route(asn=64512, geo=Geo('LU', 'Luxembourg'), tags=('ten', 'LU'), extra={'LU': 1}),
-        '10.4.0.0/16': Model(asn=1, owner=Owner(name='ten', since=dt.date(2016, 2, 2)), tags=('a',)),
-        '2001:db8::/32': 'ten',
-        '2001:db8:1::/48': {'': ''},
-    }
-    for i in range(300):
-        items[f'192.168.{i % 256}.{i // 256 * 128}/25'] = Route(asn=i % 7, geo=Geo(['LU', 'DE', 'FR'][i % 3]))
-    return items
-
-
-def test_reads_format_1(tmp_path):
-    """Files written by earlier versions are read and written again in the current format."""
-    expected = SubnetTreeBuilder()
-    expected.insert_many(format_v1_items())
-    data = (DATA / 'format_v1.pst').read_bytes()
-    assert data[8:10] == (1).to_bytes(2, 'little')
-    for loaded in (
-        SubnetTreeRS.from_bytes(data, types=[Route, Geo, Model, Owner]),
-        SubnetTreeRS.load(DATA / 'format_v1.pst', types=[Route, Geo, Model, Owner], eager=True),
-        SubnetTreeBuilder.from_bytes(data, types=[Route, Geo, Model, Owner]),
-    ):
-        assert loaded.items() == expected.items()
-        assert loaded.stats()['distinct_values'] == expected.stats()['distinct_values']
-        assert loaded.to_bytes() == expected.to_bytes(), 'converted to the canonical current format'
-    path = tmp_path / 'v2.pst'
-    SubnetTreeRS.from_bytes(data, types=[Route, Geo, Model, Owner]).dump(path)
-    assert path.read_bytes()[8:10] == pysubnettree_rs.FORMAT_VERSION.to_bytes(2, 'little')
-    assert len(path.read_bytes()) < len(data), 'repeated strings are stored once'

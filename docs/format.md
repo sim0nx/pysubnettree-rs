@@ -1,6 +1,6 @@
 # File format
 
-Version 2. All fixed-size integers are little endian. `varint` is unsigned LEB128.
+Version 3. All fixed-size integers are little endian. `varint` is unsigned LEB128.
 
 ```text
 header   magic "PYSTREE\0" (8 bytes) | version u16 | flags u16 (reserved, 0)
@@ -44,10 +44,13 @@ A value is a tag byte followed by its payload.
 | 8 | sequence (`list`/`tuple`) | varint count, values |
 | 9 | mapping (`dict`) | varint count, then (varint key string id, value) pairs |
 | 10 | object | varint type id, then fields as for tag 9 |
+| 11 | enum member | varint type id, then the member's value |
 
 Type kinds: `1` is a dataclass, rebuilt with `cls(**fields)`; `2` is a pydantic model, stored as
-`model_dump(mode='json')` and rebuilt with `cls.model_validate(fields)`. The file contains only
-type names. Loading resolves them against the classes passed to `load()` and never imports
+`model_dump(mode='json')` and rebuilt with `cls.model_validate(fields)`; `3` is an enum, whose
+members are stored by value and restored with `cls(value)` (this also restores combined flags).
+Objects (tag 10) refer to dataclasses and models, enum members (tag 11) to enums. The file
+contains only type names. Loading resolves them against the classes passed to `load()` and never imports
 anything.
 
 Each value is stored in its canonical encoding, so equal values have identical bytes. A file with
@@ -67,13 +70,14 @@ The decoder rejects any file that has:
   range;
 - string ids out of range or not in order of first use, unused or duplicate strings;
 - value ids out of range, unknown tags, invalid UTF-8, or non-canonical integers;
-- unknown type kinds, duplicate types or values, or type ids out of range;
+- unknown type kinds, duplicate types or values, type ids out of range, or objects and enum
+  members of a type of the wrong kind;
 - nesting deeper than 64 levels.
 
 Invalid input always produces an error. It never causes a crash or an inconsistent tree.
 
-## Version 1
+## Earlier versions
 
-Written by pysubnettree-rs 0.2.0 and earlier, and still read. It has no strings section: values
-contain their strings inline, tag 6 and mapping keys as varint byte length and UTF-8. Loading
-converts them to string ids. Saving always writes the current version.
+Only version 3 is read. Version 1 (pysubnettree-rs 0.2.0 and earlier) stored strings inline in
+the values; version 2 (0.3.0) had no enum members. To convert such a file, load it with the
+version that wrote it and insert its items into a builder of the current version.

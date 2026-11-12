@@ -44,11 +44,17 @@ levels deep:
 - `None`, `bool`, `int` (from -2^63 to 2^64 - 1), `float`, `str`, `bytes`
 - `list` and `tuple`
 - `dict` with `str` keys
+- enum members (`Enum`, `StrEnum`, `IntEnum`, `Flag`, ...), stored by value: lookups return the
+  member itself
 - frozen dataclasses: `@dataclass(frozen=True)`, with all fields in `__init__`
 - frozen pydantic models: `model_config = ConfigDict(frozen=True)`
 
 Anything else raises `TypeError` on insert. This ensures every tree can be saved to disk without
-`pickle`.
+`pickle`, and every value comes back as what was inserted. Subclasses of the built-in types are
+rejected for that reason, except enums: a `namedtuple`, an `OrderedDict` or a `str` subclass
+would come back as a plain `tuple`, `dict` or `str`. Convert them to the base type first.
+Mapping keys must be plain `str` (a `StrEnum` key would come back as a `str`). Inside pydantic
+models, the model itself restores its fields, so this does not apply there.
 
 ### Values are read-only
 
@@ -136,7 +142,7 @@ builder.dump('networks.pst')              # the same, without building a tree fi
 data = tree.to_bytes()
 tree = SubnetTreeRS.from_bytes(data)
 
-# data with dataclasses / pydantic models: pass the classes, they are never imported by name
+# data with dataclasses / pydantic models / enums: pass the classes, they are never imported by name
 tree = SubnetTreeRS.load('routes.pst', value_type=Route, types=[Geo])
 
 # to modify a saved tree, load it as a builder

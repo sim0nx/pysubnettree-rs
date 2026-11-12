@@ -17,8 +17,7 @@
 //! Values are numbered in order of first use by the entries, strings in order of first use by
 //! the values, so equal trees give equal files. Every string and value is used and unique.
 //!
-//! Version 1 has no strings section: values contain their strings inline. Version 1 files are
-//! still read; they are converted to string ids when loaded.
+//! Only the current version is read: earlier versions differ in the value encoding.
 //!
 //! Decoding validates everything (checksum, ordering, value ids, type ids, string ids, nesting
 //! depth, UTF-8), so a corrupted or malicious file results in an error, never in a panic or an
@@ -36,10 +35,8 @@ use crate::value::{
 };
 
 pub const MAGIC: &[u8; 8] = b"PYSTREE\0";
-/// The version written.
-pub const VERSION: u16 = 2;
-/// The oldest version read.
-const MIN_VERSION: u16 = 1;
+/// The version written and read.
+pub const VERSION: u16 = 3;
 
 const HEADER_LEN: usize = MAGIC.len() + 4;
 const CHECKSUM_LEN: usize = 8;
@@ -150,7 +147,7 @@ pub fn write<P, W: Write>(tree: &Tree<P>, out: W) -> io::Result<W> {
         out.spill()?;
     }
     // the strings used by the written values, renumbered in order of first use
-    let types = tree.types().len();
+    let types = tree.types();
     let all = tree.strings();
     let mut string_ids = vec![u32::MAX; all.len()];
     let mut strings = Vec::new();
@@ -226,7 +223,7 @@ pub fn decode<P: Default>(data: &[u8]) -> Result<Tree<P>, DecodeError> {
     }
     let (body, checksum) = data.split_at(data.len() - CHECKSUM_LEN);
     let version = u16::from_le_bytes([body[8], body[9]]);
-    if !(MIN_VERSION..=VERSION).contains(&version) {
+    if version != VERSION {
         return err(format!("unsupported format version {version}"));
     }
     if xxh3_64(body) != u64::from_le_bytes(checksum.try_into().expect("8 bytes")) {
@@ -253,8 +250,7 @@ pub fn decode<P: Default>(data: &[u8]) -> Result<Tree<P>, DecodeError> {
     }
 
     // the values are validated without building them, and copied in canonical form
-    let (strings, values) =
-        if version == 1 { decode_v1_values(&mut r, &types)? } else { decode_values(&mut r, &types)? };
+    let (strings, values) = decode_values(&mut r, &types)?;
     if has_duplicates(&values.iter().collect::<Vec<_>>()) {
         return err("duplicate value");
     }
@@ -304,14 +300,6 @@ fn decode_values(r: &mut Reader<'_>, types: &[TypeDesc]) -> Result<(StringSet, V
     Ok((StringSet::new(strings), values))
 }
 
-/// The values section of version 1 (inline strings), converted to string ids.
-fn decode_v1_values(r: &mut Reader<'_>, types: &[TypeDesc]) -> Result<(StringSet, Values), DecodeError> {
-    let mut strings = StringSet::default();
-    let mut string = |r: &mut Reader<'_>| r.str().map(|s| strings.intern(s));
-    let values = transcode_values(r, types, &mut string)?;
-    Ok((strings, values))
-}
-
 fn transcode_values<'a>(
     r: &mut Reader<'a>,
     types: &[TypeDesc],
@@ -320,7 +308,7 @@ fn transcode_values<'a>(
     let n = r.count()?;
     let mut values = Encodings::default();
     for _ in 0..n {
-        r.transcode(values.buffer(), 0, types.len(), string)?;
+        r.transcode(values.buffer(), 0, types, string)?;
         values.end();
     }
     Ok(values)
@@ -444,26 +432,6 @@ mod tests {
         data
     }
 
-    /// Version 1 files (strings inline in the values) are converted when loaded.
-    #[test]
-    fn reads_version_1() {
-        const STR: u8 = 6;
-        const MAP: u8 = 9;
-        // types | values: "a", {"a": "b"} | ipv4: 0.0.0.0/8 -> 0, 1.0.0.0/8 -> 1 | ipv6
-        let body = [0, 2, STR, 1, b'a', MAP, 1, 1, b'a', STR, 1, b'b', 2, 0, 8, 0, 0x80, 0x80, 0x80, 0x08, 8, 1, 0];
-        let v1 = load(&file(1, &body)).unwrap();
-        let mut t = Tree::new();
-        let map = Value::Map(vec![("a".into(), Value::Str("b".into()))].into());
-        t.insert_value(parse_network("0.0.0.0/8").unwrap(), Value::Str("a".into()));
-        t.insert_value(parse_network("1.0.0.0/8").unwrap(), map.clone());
-        let _ = t.compile();
-        let values: Vec<_> = v1.entries().map(|(n, v)| (n.to_string(), v.payload().clone())).collect();
-        assert_eq!(values, [("0.0.0.0/8".into(), Value::Str("a".into())), ("1.0.0.0/8".into(), map)]);
-        assert_eq!(v1.strings().iter().collect::<Vec<_>>(), ["a", "b"]);
-        assert_eq!(encode(&v1), encode(&t), "written as the current version");
-        assert_eq!(&encode(&v1)[8..10], &VERSION.to_le_bytes());
-    }
-
     /// Structurally invalid files with a valid checksum, so the validation itself is exercised.
     #[test]
     fn rejects_invalid_structure() {
@@ -471,6 +439,7 @@ mod tests {
         const STR: u8 = 6;
         const MAP: u8 = 9;
         const OBJECT: u8 = 10;
+        const ENUM: u8 = 11;
         let cases: &[(&str, &[u8])] = &[
             // types | strings | values | ipv4 | ipv6
             ("huge count", &[0, 0xff, 0xff, 0xff, 0x0f]),
@@ -493,23 +462,20 @@ mod tests {
             ("string id out of range", &[0, 1, 1, b'a', 1, STR, 1, 0, 0]),
             ("key id out of range", &[0, 1, 1, b'a', 1, MAP, 1, 1, NULL, 0, 0]),
             ("invalid UTF-8 string", &[0, 1, 1, 0xff, 1, STR, 0, 0, 0]),
+            ("enum type id out of range", &[0, 0, 1, ENUM, 0, NULL, 0, 0]),
+            ("enum type is not an enum", &[1, 1, 1, b'a', 0, 1, ENUM, 0, NULL, 1, 0, 8, 0, 0]),
+            ("object type is an enum", &[1, 3, 1, b'a', 0, 1, OBJECT, 0, 0, 1, 0, 8, 0, 0]),
         ];
         let valid: &[u8] = &[0, 2, 1, b'a', 1, b'b', 2, STR, 0, MAP, 1, 1, STR, 0, 0, 0];
+        assert!(decode::<()>(&file(VERSION, valid)).is_ok());
+        // an enum type (kind 3) and a member of it with the value 1, at 0.0.0.0/8
+        let valid: &[u8] = &[1, 3, 1, b'E', 0, 1, ENUM, 0, 3, 2, 1, 0, 8, 0, 0];
         assert!(decode::<()>(&file(VERSION, valid)).is_ok());
         for (name, body) in cases {
             assert!(decode::<()>(&file(VERSION, body)).is_err(), "{name} not rejected");
         }
-        // version 1: inline strings
-        let cases: &[(&str, &[u8])] = &[
-            ("invalid UTF-8", &[0, 1, STR, 1, 0xff, 0, 0]),
-            ("duplicate value", &[0, 2, STR, 1, b'a', STR, 1, b'a', 0, 0]),
-            ("truncated string", &[0, 1, STR, 2, b'a']),
-        ];
-        assert!(decode::<()>(&file(1, &[0, 2, STR, 1, b'a', STR, 1, b'b', 0, 0])).is_ok());
-        for (name, body) in cases {
-            assert!(decode::<()>(&file(1, body)).is_err(), "version 1: {name} not rejected");
-        }
-        for version in [0, VERSION + 1] {
+        // earlier versions encode values differently
+        for version in [0, 1, 2, VERSION + 1] {
             assert!(decode::<()>(&file(version, &[0, 0, 0, 0, 0])).is_err(), "version {version}");
         }
     }

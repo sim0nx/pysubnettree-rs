@@ -1,10 +1,12 @@
 """Values: supported types, read-only results, typed trees, deduplication, serialization."""
 
+import collections
 import dataclasses
 import datetime as dt
 import enum
 import pickle
 import types
+import typing
 
 import pydantic
 import pytest
@@ -140,7 +142,6 @@ def test_unsupported_values():
         ({1: 'x'}, TypeError),
         ({'a': {1, 2}}, TypeError),
         (1j, TypeError),
-        (Color.RED, TypeError),
         (dt.date(2000, 1, 1), TypeError),
         (Mutable(1), TypeError),
         (2**64, OverflowError),
@@ -153,12 +154,47 @@ def test_unsupported_values():
             t['10.0.0.0/8'] = value
         assert len(t) == 0
 
-    class Shade(enum.IntEnum):
-        DARK = 1
+    # subclasses of built-in types could not be restored: rejected, also nested
+    class Name(str):
+        __slots__ = ()
+
+    class Number(int):
+        pass
+
+    class Pair(typing.NamedTuple):
+        a: int
+        b: int
+
+    class Plain(collections.abc.Mapping):
+        def __getitem__(self, key):
+            return 1
+
+        def __iter__(self):
+            return iter(['a'])
+
+        def __len__(self):
+            return 1
+
+    for value in [
+        Pair(1, 2),
+        collections.OrderedDict(a=1),
+        collections.defaultdict(int),
+        Name('x'),
+        Number(1),
+        Plain(),
+        [Name('x')],
+        {'a': Number(1)},
+        {Rir.RIPE: 1},  # restored as a str key
+        {Name('k'): 1},
+        Route(asn=1, tags=(Name('x'),)),
+    ]:
+        t = SubnetTreeBuilder()
+        with pytest.raises(TypeError, match='unsupported value type|mapping keys must be str'):
+            t['10.0.0.0/8'] = value
+        assert len(t) == 0
 
     t = SubnetTreeBuilder()
-    t['10.0.0.0/8'] = Shade.DARK  # int subclasses are stored as int
-    assert type(t['10.0.0.1']) is int
+    t['10.0.0.0/8'] = Color.RED  # enums are supported
     # two different classes with the same qualified name can not be mixed in one tree
     t['11.0.0.0/8'] = Geo('LU')
     impostor = dataclasses.make_dataclass('Geo', [('country', str)], frozen=True)
@@ -188,6 +224,98 @@ def test_insert_many_reuses_objects():
 
 
 def test_module_metadata():
-    assert pysubnettree_rs.FORMAT_VERSION == 2
+    assert pysubnettree_rs.FORMAT_VERSION == 3
     assert pysubnettree_rs.__version__
     assert SubnetTreeRS.__module__ == 'pysubnettree_rs'
+
+
+class Rir(enum.StrEnum):
+    RIPE = 'ripe'
+    ARIN = 'arin'
+
+
+class Kind(enum.IntEnum):
+    TRANSIT = 1
+    STUB = 2
+
+
+class Perm(enum.IntFlag):
+    R = 1
+    W = 2
+
+
+class Color(enum.Enum):
+    RED = (255, 0, 0)
+    GREEN = (0, 255, 0)
+
+
+@dataclasses.dataclass(frozen=True)
+class ASNet:
+    rir: Rir
+    kind: Kind
+    perm: Perm
+    color: Color | None = None
+
+
+class ASModel(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(frozen=True)
+
+    rir: Rir
+    kinds: tuple[Kind, ...] = ()
+
+
+ENUM_TYPES = [ASNet, ASModel, Rir, Kind, Perm, Color]
+
+
+def test_enums():
+    """Enum members are stored as members of their enum and restored as the same members."""
+    value = ASNet(Rir.RIPE, Kind.TRANSIT, Perm.R | Perm.W, Color.GREEN)
+    for result in roundtrips(value, ASNet, ENUM_TYPES):
+        assert result == value
+        assert result.rir is Rir.RIPE
+        assert result.kind is Kind.TRANSIT
+        assert result.perm is Perm.R | Perm.W, 'combined flags'
+        assert result.color is Color.GREEN
+    for member in (Rir.ARIN, Kind.STUB, Perm.W, Color.RED, Perm(0)):
+        assert all(r is member for r in roundtrips(member, None, ENUM_TYPES))
+    for result in roundtrips((Kind.STUB, {'rir': Rir.ARIN}), None, ENUM_TYPES):
+        assert result == (Kind.STUB, types.MappingProxyType({'rir': Rir.ARIN}))
+        assert result[0] is Kind.STUB
+        assert result[1]['rir'] is Rir.ARIN
+    # pydantic restores its enums itself
+    model = ASModel(rir=Rir.RIPE, kinds=(Kind.STUB,))
+    for result in roundtrips(model, ASModel, ENUM_TYPES):
+        assert result == model
+        assert result.rir is Rir.RIPE
+        assert result.kinds[0] is Kind.STUB
+
+    # members are distinct from their values (type-exact, like 1 and True)
+    t = SubnetTreeBuilder()
+    t.insert_many({'10.0.0.0/8': Kind.TRANSIT, '11.0.0.0/8': 1, '12.0.0.0/8': Rir.RIPE, '13.0.0.0/8': 'ripe'})
+    assert t.stats()['distinct_values'] == 4
+    assert type(t['11.0.0.1']) is int
+    assert type(t['13.0.0.1']) is str
+    assert t['10.0.0.1'] is Kind.TRANSIT
+
+    # the enum classes must be passed to load, like dataclasses; value_type checks them too
+    data = t.build().to_bytes()
+    with pytest.raises(ValueError, match='Kind; pass the class'):
+        SubnetTreeRS.from_bytes(data, types=[Rir])
+    with pytest.raises(ValueError, match='expected int'):
+        SubnetTreeRS.from_bytes(data, value_type=int, types=[Rir, Kind])
+    typed = SubnetTreeBuilder(value_type=Kind)
+    typed['10.0.0.0/8'] = Kind.STUB
+    with pytest.raises(TypeError, match='must be of type Kind'):
+        typed['11.0.0.0/8'] = 2  # type: ignore[assignment]
+    assert SubnetTreeRS.from_bytes(typed.build().to_bytes(), value_type=Kind)['10.0.0.1'] is Kind.STUB
+    with pytest.raises(ValueError, match='expected Rir'):
+        SubnetTreeRS.from_bytes(typed.build().to_bytes(), value_type=Rir, types=[Kind])
+    # a pickled tree passes its enum classes along
+    assert pickle.loads(pickle.dumps(t.build()))['12.0.0.1'] is Rir.RIPE  # noqa: S301
+
+    # the value of a member must be storable itself
+    class Opaque(enum.Enum):
+        THING = object()
+
+    with pytest.raises(TypeError, match='unsupported value type object'):
+        SubnetTreeBuilder()['10.0.0.0/8'] = Opaque.THING

@@ -263,7 +263,7 @@ fn check_value_types<P>(py: Python<'_>, tree: &Tree<P>, classes: &[TypeInfo], cl
             (tag::STR, _) => py.get_type::<PyString>(),
             (tag::BYTES, _) => py.get_type::<PyBytes>(),
             (tag::SEQ, _) => py.get_type::<PyTuple>(),
-            (tag::OBJECT, Some(id)) => classes[id as usize].cls.bind(py).clone(),
+            (tag::OBJECT | tag::ENUM, Some(id)) => classes[id as usize].cls.bind(py).clone(),
             _ => mapping_proxy.clone(),
         }
     };
