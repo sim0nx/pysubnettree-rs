@@ -43,6 +43,15 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           # every interpreter in the build container, free-threaded ones included
           args: --release --out dist --find-interpreter
+      - name: Wheels for the newest interpreters were built
+        shell: bash
+        run: |
+          for abi in cp314 cp314t cp315 cp315t; do
+            if ! compgen -G "dist/*-cp3*-${abi}-*.whl" > /dev/null; then
+              echo "::error::no ${abi} wheel built"
+              exit 1
+            fi
+          done
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-linux-${{ matrix.manylinux }}-${{ matrix.target }}
@@ -61,10 +70,21 @@ jobs:
             3.13
             3.14
             3.14t
+            3.15
+            3.15t
       - uses: PyO3/maturin-action@v1
         with:
           target: universal2-apple-darwin
           args: --release --out dist --find-interpreter
+      - name: Wheels for the newest interpreters were built
+        shell: bash
+        run: |
+          for abi in cp314 cp314t cp315 cp315t; do
+            if ! compgen -G "dist/*-cp3*-${abi}-*.whl" > /dev/null; then
+              echo "::error::no ${abi} wheel built"
+              exit 1
+            fi
+          done
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-macos
@@ -83,10 +103,21 @@ jobs:
             3.13
             3.14
             3.14t
+            3.15
+            3.15t
       - uses: PyO3/maturin-action@v1
         with:
           target: x64
           args: --release --out dist --find-interpreter
+      - name: Wheels for the newest interpreters were built
+        shell: bash
+        run: |
+          for abi in cp314 cp314t cp315 cp315t; do
+            if ! compgen -G "dist/*-cp3*-${abi}-*.whl" > /dev/null; then
+              echo "::error::no ${abi} wheel built"
+              exit 1
+            fi
+          done
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-windows
@@ -112,7 +143,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.11', '3.14', '3.14t']
+        python-version: ['3.11', '3.14', '3.14t', '3.15', '3.15t']
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
