@@ -43,10 +43,10 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           # every interpreter in the build container, free-threaded ones included
           args: --release --out dist --find-interpreter
-      - name: Wheels for the newest interpreters were built
+      - name: A wheel for every supported interpreter was built
         shell: bash
         run: |
-          for abi in cp314 cp314t cp315 cp315t; do
+          for abi in cp311 cp312 cp313 cp314 cp314t cp315 cp315t; do
             if ! compgen -G "dist/*-cp3*-${abi}-*.whl" > /dev/null; then
               echo "::error::no ${abi} wheel built"
               exit 1
@@ -57,70 +57,39 @@ jobs:
           name: wheels-linux-${{ matrix.manylinux }}-${{ matrix.target }}
           path: dist/
 
-  macos:
-    name: Wheels (macOS universal2)
-    runs-on: macos-latest
+  native:
+    # One interpreter per job, passed explicitly: with 3.14 and 3.14t (or 3.15 and 3.15t) installed
+    # side by side, `--find-interpreter` sees only one of them per version on macOS and Windows.
+    name: Wheels (${{ matrix.os == 'macos-latest' && 'macOS universal2' || 'Windows x64' }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+        python-version: ['3.11', '3.12', '3.13', '3.14', '3.14t', '3.15', '3.15t']
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
+        id: python
         with:
-          python-version: |
-            3.11
-            3.12
-            3.13
-            3.14
-            3.14t
-            3.15
-            3.15t
+          python-version: ${{ matrix.python-version }}
       - uses: PyO3/maturin-action@v1
         with:
-          target: universal2-apple-darwin
-          args: --release --out dist --find-interpreter
-      - name: Wheels for the newest interpreters were built
+          target: ${{ matrix.os == 'macos-latest' && 'universal2-apple-darwin' || 'x64' }}
+          args: --release --out dist --interpreter ${{ steps.python.outputs.python-path }}
+      - name: Exactly the wheel for this interpreter was built
         shell: bash
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
         run: |
-          for abi in cp314 cp314t cp315 cp315t; do
-            if ! compgen -G "dist/*-cp3*-${abi}-*.whl" > /dev/null; then
-              echo "::error::no ${abi} wheel built"
-              exit 1
-            fi
-          done
+          abi="cp${PYTHON_VERSION//./}"
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ] || ! compgen -G "dist/*-cp3*-${abi}-*.whl" > /dev/null; then
+            echo "::error::expected one ${abi} wheel, got: ${wheels[*]}"
+            exit 1
+          fi
       - uses: actions/upload-artifact@v7
         with:
-          name: wheels-macos
-          path: dist/
-
-  windows:
-    name: Wheels (Windows x64)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: |
-            3.11
-            3.12
-            3.13
-            3.14
-            3.14t
-            3.15
-            3.15t
-      - uses: PyO3/maturin-action@v1
-        with:
-          target: x64
-          args: --release --out dist --find-interpreter
-      - name: Wheels for the newest interpreters were built
-        shell: bash
-        run: |
-          for abi in cp314 cp314t cp315 cp315t; do
-            if ! compgen -G "dist/*-cp3*-${abi}-*.whl" > /dev/null; then
-              echo "::error::no ${abi} wheel built"
-              exit 1
-            fi
-          done
-      - uses: actions/upload-artifact@v7
-        with:
-          name: wheels-windows
+          name: wheels-${{ matrix.os }}-${{ matrix.python-version }}
           path: dist/
 
   sdist:
@@ -166,7 +135,7 @@ jobs:
   publish:
     name: Upload to PyPI
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check-version, linux, macos, windows, sdist, smoke-test]
+    needs: [check-version, linux, native, sdist, smoke-test]
     runs-on: ubuntu-latest
     permissions:
       # IMPORTANT: this permission is mandatory for trusted publishing
