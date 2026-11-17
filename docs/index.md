@@ -26,11 +26,11 @@ Requires Python 3.11 or newer. Free-threaded Python (3.14t) is supported.
 ## Compared to pysubnettree
 
 Measured on a full 2016 routeviews table (644,586 IPv4 and IPv6 prefixes with AS numbers as
-values), Python 3.14, release build. Run `benchmarks/bench.py` to reproduce.
+values), pysubnettree-rs 0.4.1, Python 3.13, release build. Run `benchmarks/bench.py` to reproduce.
 
 | | pysubnettree-rs | pysubnettree |
 |---|---:|---:|
-| Load | 0.27 s | 0.34 s |
-| Lookup (random addresses, incl. ~20 ns loop overhead) | ~240 ns | ~1,230 ns |
-| Memory (RSS) | 24 MB | 98 MB |
-| Save / load from file | 4.1 MB / 0.035 s | not supported |
+| Load | 0.24 s | 0.32 s |
+| Lookup (random addresses, incl. ~30 ns loop overhead) | ~110 ns | ~750 ns |
+| Memory (RSS) | 16 MB | 98 MB |
+| Save / load from file | 4.3 MB / 0.031 s | not supported |
