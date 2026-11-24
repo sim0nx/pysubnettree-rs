@@ -31,6 +31,7 @@ const MAPPED_PREFIX: u128 = 0xffff;
 impl Address {
     /// Converts an address, IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) become IPv4.
     #[must_use]
+    #[expect(clippy::cast_possible_truncation, reason = "a mapped IPv4 address is the low 32 bits")]
     pub fn from_ip(ip: IpAddr) -> Self {
         match ip {
             IpAddr::V4(a) => Self::V4(u32::from(a)),
@@ -54,6 +55,7 @@ impl Network {
     ///
     /// # Errors
     /// If the prefix length is too large for the address family.
+    #[expect(clippy::cast_possible_truncation, reason = "a mapped IPv4 address is the low 32 bits")]
     pub fn new(ip: IpAddr, len: u8) -> Result<Self, ParseError> {
         match ip {
             IpAddr::V4(a) if len <= 32 => Ok(Self::V4(u32::from(a).network(len), len)),
@@ -71,7 +73,7 @@ impl Network {
 
     /// The host route (`/32` or `/128`) of an address.
     #[must_use]
-    pub fn host(addr: Address) -> Self {
+    pub const fn host(addr: Address) -> Self {
         match addr {
             Address::V4(a) => Self::V4(a, 32),
             Address::V6(a) => Self::V6(a, 128),
@@ -79,7 +81,7 @@ impl Network {
     }
 
     #[must_use]
-    pub fn prefix_len(self) -> u8 {
+    pub const fn prefix_len(self) -> u8 {
         match self {
             Self::V4(_, l) | Self::V6(_, l) => l,
         }
@@ -190,18 +192,18 @@ impl<P> Tree<P> {
 
     /// Number of networks.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.v4.len() + self.v6.len()
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Number of IPv4 and IPv6 networks.
     #[must_use]
-    pub fn len_by_family(&self) -> (usize, usize) {
+    pub const fn len_by_family(&self) -> (usize, usize) {
         (self.v4.len(), self.v6.len())
     }
 
@@ -621,7 +623,7 @@ mod tests {
         t.insert_value(net("11.0.0.0/8"), pair("b", "c"));
         t.insert_value(net("12.0.0.0/8"), pair("c", "a"));
         assert_eq!(t.strings().iter().collect::<Vec<_>>(), ["a", "b", "c"], "each string is stored once");
-        assert!(t.compile().is_empty());
+        assert_eq!(t.compile(), Vec::<Value>::new(), "nothing to compact");
 
         // a copy shares the strings; replacing a value does not change the copy
         let copy = t.clone_with(Value::clone);

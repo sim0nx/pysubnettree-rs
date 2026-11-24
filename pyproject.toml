@@ -160,7 +160,7 @@ select = [
   "COM", # flake8-commas
   "C4", # flake8-comprehensions
   "DTZ", # flake8-datetimez
-  "EM103", # flake8-errmsg - dot-format-in-exception
+  "EM", # flake8-errmsg
   "EXE", # flake8-executable
   "ISC", # flake8-implicit-str-concat
   "ICN", # flake8-import-conventions
@@ -182,7 +182,10 @@ select = [
   "PL", # Pylint
   "FLY", # flynt
   "PERF", # Perflint
-  "RUF013", # implicit-optional
+  "RUF", # Ruff-specific rules
+  "SIM", # flake8-simplify
+  "PT", # flake8-pytest-style
+  "TRY", # tryceratops
 ]
 unfixable = [
   "ERA001",
@@ -217,6 +220,8 @@ runtime-evaluated-decorators = ["dataclasses.dataclass"]
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = [
   "ANN", # Missing return type annotation
+  "EM101", # literal exception messages are fine in tests
+  "TRY003", # long exception messages are fine in tests
   "D", # Missing docstring
   "ERA001", # Found commented-out code
   "INP001", # tests are not a package

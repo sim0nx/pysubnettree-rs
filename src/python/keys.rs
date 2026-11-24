@@ -23,7 +23,7 @@ pub enum Key {
 
 impl Key {
     /// The key as a network (an address is a host route).
-    pub fn network(self) -> Network {
+    pub const fn network(self) -> Network {
         match self {
             Self::Addr(a) => Network::host(a),
             Self::Net(n) => n,

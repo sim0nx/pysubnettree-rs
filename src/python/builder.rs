@@ -128,7 +128,7 @@ pub struct SubnetTreeBuilder {
 }
 
 impl SubnetTreeBuilder {
-    pub(crate) fn from_data(data: Data, value_type: Option<Py<PyType>>) -> Self {
+    pub(crate) const fn from_data(data: Data, value_type: Option<Py<PyType>>) -> Self {
         Self { inner: RwLock::new(data), value_type }
     }
 
@@ -354,7 +354,7 @@ impl SubnetTreeBuilder {
         self.insert(py, network, Some(value)).map(|_| ())
     }
 
-    /// Removes exactly this network and returns its value. Raises KeyError if it does not exist.
+    /// Removes exactly this network and returns its value. Raises `KeyError` if it does not exist.
     fn remove(&self, py: Python<'_>, network: &Bound<'_, PyAny>) -> PyResult<Payload> {
         let net = extract_network(network)?;
         loop {
@@ -402,7 +402,7 @@ impl SubnetTreeBuilder {
     // --- lookups (convenience; compile pending modifications first) ------------------------
 
     /// Value of the most specific network containing the address (or network).
-    /// Raises KeyError if there is none.
+    /// Raises `KeyError` if there is none.
     fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Payload> {
         let k = extract_key(key)?;
         let found = {

@@ -119,7 +119,7 @@ def test_invalid_and_corrupted_data():
     for i in range(len(data)):
         corrupted = bytearray(data)
         corrupted[i] ^= 0x01
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=r'subnet tree|checksum|version'):
             SubnetTreeRS.from_bytes(bytes(corrupted), types=[Route, Geo])
 
 

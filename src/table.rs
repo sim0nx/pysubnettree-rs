@@ -66,6 +66,10 @@ pub trait Addr: Copy + Ord + Eq + Hash + Debug + Default + Send + Sync + 'static
 
 macro_rules! impl_addr {
     ($t:ty, $adaptive:expr, $l2:expr) => {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "BITS is 32 or 128, and index buckets and slices are below 2^24"
+        )]
         impl Addr for $t {
             const BITS: u8 = <$t>::BITS as u8;
             const ZERO: Self = 0;
@@ -154,14 +158,15 @@ impl<A: Addr> Index<A> {
                     common = common.min(diff.leading_zeros()).min(u32::from(l));
                 }
                 offset = common.min(bits - INDEX_L1 - l2_bits);
-                region = first.network(offset as u8);
+                region = first.network(u8::try_from(offset).expect("offset is below the address width"));
             }
         }
         let first_at_or_after = |addr: Option<A>| -> u32 {
             let pos = addr.map_or(starts.len(), |a| starts.partition_point(|&s| s < a));
             u32::try_from(pos).expect("too many intervals")
         };
-        let region_end = region.broadcast(offset as u8).checked_inc();
+        let region_end =
+            region.broadcast(u8::try_from(offset).expect("offset is below the address width")).checked_inc();
         // first address of the region's slot `slot` with `width` index bits
         let slot_start = |width: u32, slot: u128| -> Option<A> {
             if slot >> width != 0 {
@@ -202,6 +207,7 @@ impl<A: Addr> Index<A> {
 
     /// Range of interval starts to search for `addr`.
     #[inline(always)]
+    #[expect(clippy::inline_always, reason = "the lookup hot path, see docs/algorithms.md")]
     fn range(&self, addr: A) -> (usize, usize) {
         let k = if A::INDEX_ADAPTIVE {
             addr.index_bucket(self.region, u32::from(A::BITS) - self.offset - INDEX_L1, 1 << INDEX_L1)
@@ -284,12 +290,12 @@ impl<A: Addr> PrefixTable<A> {
 
     /// Number of prefixes.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
@@ -582,6 +588,7 @@ impl<A: Addr> PrefixTable<A> {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation, reason = "random numbers are truncated on purpose")]
 mod tests {
     use super::*;
 

@@ -1,5 +1,6 @@
 """Property based tests comparing SubnetTreeRS against a naive reference implementation."""
 
+import contextlib
 import ipaddress
 import types
 
@@ -119,7 +120,5 @@ def test_value_roundtrip(value):
 @settings(max_examples=200, deadline=None)
 @given(st.binary(max_size=200))
 def test_arbitrary_bytes_never_crash(data):
-    try:
+    with contextlib.suppress(ValueError):
         SubnetTreeRS.from_bytes(b'PYSTREE\x00\x01\x00\x00\x00' + data)
-    except ValueError:
-        pass

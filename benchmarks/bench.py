@@ -13,6 +13,7 @@ The extension must be a release build, and uv must not rebuild it in debug mode:
 """
 
 import argparse
+import contextlib
 import ctypes
 import dataclasses
 import gc
@@ -195,10 +196,8 @@ def environment(lookups: int, runs: int, repeat: int) -> str:
     )
     versions = []
     for dist in ('pysubnettree-rs', 'pysubnettree'):
-        try:
+        with contextlib.suppress(importlib.metadata.PackageNotFoundError):
             versions.append(f'{dist} {importlib.metadata.version(dist)}')
-        except importlib.metadata.PackageNotFoundError:
-            pass
     versions_text = ', '.join(versions)
     return f'{cpu}, Python {platform.python_version()}, {versions_text}; {lookups:,} lookups per set, median of {runs} passes in each of {repeat} processes.'
 

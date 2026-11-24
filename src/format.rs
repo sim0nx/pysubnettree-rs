@@ -387,18 +387,6 @@ mod tests {
     /// than the buffer, and tables spanning many buffer flushes.
     #[test]
     fn streaming_write() {
-        let mut t = sample();
-        t.insert_value(parse_network("1.0.0.0/8").unwrap(), Value::Bytes(vec![7; 3 * BUFFER].into()));
-        t.insert_value(parse_network("2.0.0.0/8").unwrap(), Value::Str("x".repeat(BUFFER / 4).into()));
-        for i in 0..40_000u32 {
-            let net = Network::V4(0x6400_0000 + (i << 8), 24);
-            t.insert_value(net, Value::Int(i64::from(i % 1000)));
-        }
-        let _ = t.compile();
-        let data = encode(&t);
-        assert!(data.len() > 4 * BUFFER);
-        assert_eq!(load(&data).unwrap().len(), t.len());
-
         /// Accepts at most 1000 bytes per call.
         struct Trickle(Vec<u8>);
         impl Write for Trickle {
@@ -411,8 +399,6 @@ mod tests {
                 Ok(())
             }
         }
-        assert_eq!(write(&t, Trickle(Vec::new())).unwrap().0, data);
-
         /// Fails after some bytes.
         struct Full(usize);
         impl Write for Full {
@@ -424,6 +410,20 @@ mod tests {
                 Ok(())
             }
         }
+        let mut t = sample();
+        t.insert_value(parse_network("1.0.0.0/8").unwrap(), Value::Bytes(vec![7; 3 * BUFFER].into()));
+        t.insert_value(parse_network("2.0.0.0/8").unwrap(), Value::Str("x".repeat(BUFFER / 4).into()));
+        for i in 0..40_000u32 {
+            let net = Network::V4(0x6400_0000 + (i << 8), 24);
+            t.insert_value(net, Value::Int(i64::from(i % 1000)));
+        }
+        let _ = t.compile();
+        let data = encode(&t);
+        assert!(data.len() > 4 * BUFFER);
+        assert_eq!(load(&data).unwrap().len(), t.len());
+
+        assert_eq!(write(&t, Trickle(Vec::new())).unwrap().0, data);
+
         assert!(write(&t, Full(data.len() / 2)).is_err());
         assert!(write(&t, Full(data.len())).is_ok());
     }

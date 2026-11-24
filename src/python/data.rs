@@ -387,7 +387,7 @@ impl<T> Collected<T> {
         py: Python<'_>,
         lock: impl FnOnce() -> G,
     ) -> PyResult<Vec<(T, Payload)>> {
-        let Collected { items, pending, epoch, classes } = self;
+        let Self { items, pending, epoch, classes } = self;
         let mut built: HashMap<u32, Payload> = HashMap::with_capacity(pending.len());
         for (id, value) in pending {
             let value = value.map_err(|e| decode_err(&e))?;

@@ -143,7 +143,7 @@ def test_unsupported_values():
         RED = 1
 
     for cls in (Mutable, NoInit, MutableModel):
-        with pytest.raises(TypeError, match='frozen|init=False'):
+        with pytest.raises(TypeError, match=r'frozen|init=False'):
             SubnetTreeBuilder(value_type=cls)
     nested: list = []
     for _ in range(70):
@@ -202,7 +202,7 @@ def test_unsupported_values():
         Route(asn=1, tags=(Name('x'),)),
     ]:
         t = SubnetTreeBuilder()
-        with pytest.raises(TypeError, match='unsupported value type|mapping keys must be str'):
+        with pytest.raises(TypeError, match=r'unsupported value type|mapping keys must be str'):
             t['10.0.0.0/8'] = value
         assert len(t) == 0
 

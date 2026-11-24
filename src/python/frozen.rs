@@ -47,7 +47,7 @@ impl SubnetTreeRS {
     }
 
     /// Value of the most specific network containing the address (or network).
-    /// Raises KeyError if there is none.
+    /// Raises `KeyError` if there is none.
     fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Payload> {
         match self.data.find_value(extract_key(key)?) {
             Some(entry) => self.data.object(py, entry),
@@ -97,6 +97,7 @@ impl SubnetTreeRS {
         }
     }
 
+    #[expect(clippy::missing_const_for_fn, reason = "a Python method")]
     fn __len__(&self) -> usize {
         self.data.tree.len()
     }
@@ -146,7 +147,7 @@ impl SubnetTreeRS {
 
     /// Creates a tree from data produced by :meth:`to_bytes`. Dataclasses and pydantic models
     /// in the data are rebuilt with the classes given as ``value_type`` or in ``types``.
-    /// Raises ValueError for invalid or corrupted data, or values not of ``value_type``.
+    /// Raises `ValueError` for invalid or corrupted data, or values not of ``value_type``.
     ///
     /// The data is fully validated, but the object of a value is only built when a lookup
     /// first returns it, so errors raised while building an object (a dataclass

@@ -55,12 +55,12 @@ pub enum Value {
     Float(f64),
     Str(Box<str>),
     Bytes(Box<[u8]>),
-    Seq(Box<[Value]>),
+    Seq(Box<[Self]>),
     Map(Fields),
     /// An instance of a registered type (dataclass, pydantic model), see [`TypeDesc`].
     Object(u32, Fields),
     /// A member of a registered enum type, given by its value.
-    Enum(u32, Box<Value>),
+    Enum(u32, Box<Self>),
 }
 
 impl Value {
@@ -85,7 +85,7 @@ pub enum TypeKind {
 
 impl TypeKind {
     #[must_use]
-    pub fn from_u8(v: u8) -> Option<Self> {
+    pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(Self::Dataclass),
             2 => Some(Self::Pydantic),
@@ -289,11 +289,11 @@ pub(crate) struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
+    pub const fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
     }
 
-    pub fn remaining(&self) -> usize {
+    pub const fn remaining(&self) -> usize {
         self.data.len() - self.pos
     }
 
@@ -646,7 +646,7 @@ impl Encodings {
     }
 
     /// The buffer to write the next encoding to, completed with [`Encodings::end`].
-    pub fn buffer(&mut self) -> &mut Vec<u8> {
+    pub const fn buffer(&mut self) -> &mut Vec<u8> {
         &mut self.data
     }
 
@@ -683,7 +683,7 @@ impl<P> Copy for ValueRef<'_, P> {}
 impl<'a, P> ValueRef<'a, P> {
     /// The id of the value in its store.
     #[must_use]
-    pub fn id(&self) -> u32 {
+    pub const fn id(&self) -> u32 {
         self.id
     }
 
@@ -758,7 +758,7 @@ impl<P> ValueStore<P> {
     /// encoding them again start a new one, and every store has its own. Lets a caller which
     /// released a lock check whether an id it got is still valid.
     #[must_use]
-    pub fn epoch(&self) -> u64 {
+    pub const fn epoch(&self) -> u64 {
         self.epoch
     }
 
@@ -806,6 +806,7 @@ impl<P> ValueStore<P> {
     }
 
     /// A store with the same values (sharing the encodings) and other payloads, by id.
+    #[must_use]
     pub fn map_payloads<Q>(&self, payloads: Vec<Q>) -> ValueStore<Q> {
         assert_eq!(payloads.len(), self.len());
         ValueStore { encodings: Arc::clone(&self.encodings), payloads, dedup: None, epoch: next_epoch() }
