@@ -47,6 +47,42 @@ def test_bytes_file_and_pickle(tree, tmp_path):
         tree.dump(tmp_path / 'missing' / 'tree.pst')
 
 
+def test_dump_is_atomic(tmp_path):
+    # a symlink where earlier versions put their temporary file is neither followed nor removed
+    victim = tmp_path / 'victim.txt'
+    victim.write_text('keep me')
+    path = tmp_path / 'tree.pst'
+    try:
+        (tmp_path / 'tree.pst.tmp').symlink_to(victim)
+    except OSError:  # pragma: no cover - Windows without symlink privilege
+        pytest.skip('symlinks not supported')
+    SubnetTreeBuilder().build().dump(path)
+    assert victim.read_text() == 'keep me'
+    assert not path.is_symlink()
+
+    # concurrent writers to one path: the file is always complete, the last rename wins
+    trees = []
+    for i in range(8):
+        builder = SubnetTreeBuilder()
+        builder.insert_many((f'{10 + i}.{j // 256}.{j % 256}.0/24', j) for j in range(20_000))
+        trees.append(builder.build())
+    expected = {t.to_bytes() for t in trees}
+    barrier = threading.Barrier(len(trees))
+
+    def dump(t):
+        barrier.wait()
+        for _ in range(5):
+            t.dump(path)
+
+    threads = [threading.Thread(target=dump, args=(t,)) for t in trees]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert path.read_bytes() in expected
+    assert sorted(p.name for p in tmp_path.iterdir()) == ['tree.pst', 'tree.pst.tmp', 'victim.txt'], 'no temporary file left'
+
+
 def test_invalid_and_corrupted_data():
     for data in [b'', b'garbage', b'PYSTREE\x00' + bytes(20)]:
         with pytest.raises(ValueError, match='subnet tree|checksum|version'):

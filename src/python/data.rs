@@ -7,8 +7,10 @@
 //! after releasing it (building runs Python code).
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io;
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
@@ -19,6 +21,7 @@ use pyo3::{PyTraverseError, PyVisit};
 use super::keys::Key;
 use super::values::{TypeInfo, build, classify};
 use crate::format;
+use crate::strings::random_seed;
 use crate::tree::{Match, Network, Tree};
 use crate::value::{DecodeError, Value, ValueRef, head, tag};
 
@@ -166,20 +169,11 @@ impl Data {
         py.detach(|| format::encode(tree))
     }
 
-    /// Writes atomically: to a temporary file which is then renamed. The data is streamed into
-    /// the file, it is never held in memory as a whole.
+    /// Writes atomically: to a new temporary file next to `path`, which is then renamed. The
+    /// data is streamed into the file, it is never held in memory as a whole.
     pub fn dump(&self, py: Python<'_>, path: &Path) -> PyResult<()> {
         let tree = &self.tree;
-        py.detach(|| {
-            let mut tmp = path.as_os_str().to_owned();
-            tmp.push(".tmp");
-            let written = std::fs::File::create(&tmp)
-                .and_then(|file| format::write(tree, file))
-                .and_then(|_| std::fs::rename(&tmp, path));
-            written.inspect_err(|_| {
-                let _ = std::fs::remove_file(&tmp);
-            })
-        })?;
+        py.detach(|| write_atomically(path, |file| format::write(tree, file).map(drop)))?;
         Ok(())
     }
 
@@ -247,6 +241,51 @@ impl Data {
     ) -> PyResult<Self> {
         let data = py.detach(|| std::fs::read(path))?;
         Self::decode(py, &data, value_type, types, eager)
+    }
+}
+
+/// Writes a file atomically: `write` fills a new temporary file in the same directory, which is
+/// flushed to disk and renamed to `path`. Readers see the old file or the complete new one, also
+/// after a crash.
+///
+/// The temporary file has a random name and is created exclusively, so it never follows a
+/// symlink or truncates an existing file, and concurrent writers to one path do not interfere
+/// (the last rename wins). It is removed if anything fails.
+fn write_atomically(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+    let (file, tmp) = create_temporary(path)?;
+    let written = (|| {
+        let mut file = file;
+        write(&mut file)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return written;
+    }
+    // make the rename itself durable, best effort: some file systems refuse to sync a
+    // directory, and directories can not be opened like this on Windows
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+        let _ = File::open(dir).and_then(|d| d.sync_all());
+    }
+    Ok(())
+}
+
+/// Creates a new file `<path>.<random>.tmp`, retrying with another name if it exists.
+fn create_temporary(path: &Path) -> io::Result<(File, PathBuf)> {
+    let mut attempts = 0;
+    loop {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".{:016x}.tmp", random_seed()));
+        let tmp = PathBuf::from(tmp);
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => return Ok((file, tmp)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempts < 10 => attempts += 1,
+            Err(e) => return Err(e),
+        }
     }
 }
 

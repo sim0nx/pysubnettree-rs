@@ -135,7 +135,7 @@ builder.clear()
 ## Saving and loading
 
 ```python
-tree.dump('networks.pst')                 # written atomically (temporary file + rename)
+tree.dump('networks.pst')                 # atomic: a new temporary file, synced, then renamed
 tree = SubnetTreeRS.load('networks.pst')
 builder.dump('networks.pst')              # the same, without building a tree first
 
