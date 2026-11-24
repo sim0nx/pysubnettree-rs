@@ -36,7 +36,7 @@ dynamic = ["version"]
 
 [project.urls]
 Homepage = "https://github.com/sim0nx/pysubnettree-rs"
-Documentation = "https://github.com/sim0nx/pysubnettree-rs"
+Documentation = "https://pysubnettree-rs.readthedocs.io/"
 Source = "https://github.com/sim0nx/pysubnettree-rs"
 Tracker = "https://github.com/sim0nx/pysubnettree-rs/issues"
 

@@ -116,13 +116,17 @@ it only once per batch of 16,384 networks, which matters for pydantic models (`m
 A network with no value matches and returns `None`. Use `tree[key]` or `key in tree` to tell
 "matched, no value" apart from "no match".
 
+A key that is not an IP address or network raises an error in every lookup, `in` included:
+`ValueError` for a string that does not parse (`'foo' in tree`), `TypeError` for other types
+(`None in tree`). A mistyped address fails loudly instead of reading as "not found".
+
 If the key is a network, for example `'10.1.2.0/24'`, the result is the most specific stored
 network that contains the whole key network.
 
 IPv4-mapped IPv6 addresses and networks (`::ffff:192.0.2.1`, `::ffff:192.0.2.0/120`) are treated
 as IPv4. As a consequence, IPv6 networks shorter than `/96` that cover the mapped range, such as
-`::/0`, do not match IPv4-mapped addresses. (pysubnettree stores IPv4 inside one IPv6 tree and
-behaves differently here.)
+`::/0`, do not match IPv4-mapped addresses, and `::ffff:0:0/96` is the IPv4 network
+`0.0.0.0/0`. (pysubnettree stores IPv4 inside one IPv6 tree and behaves differently here.)
 
 Exact matches without longest prefix matching: `has_network(network)` and
 `get_exact(network, default=None)`.
