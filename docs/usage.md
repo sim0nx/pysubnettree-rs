@@ -47,7 +47,9 @@ levels deep:
 - enum members (`Enum`, `StrEnum`, `IntEnum`, `Flag`, ...), stored by value: lookups return the
   member itself
 - frozen dataclasses: `@dataclass(frozen=True)`, with all fields in `__init__`
-- frozen pydantic models: `model_config = ConfigDict(frozen=True)`
+- frozen pydantic models: `model_config = ConfigDict(frozen=True)`. They are stored by field
+  name and validated by field name when restored, so field aliases work. This needs pydantic
+  2.11 or newer; with older versions, models with aliases raise an error on insert
 
 Anything else raises `TypeError` on insert. This ensures every tree can be saved to disk without
 `pickle`, and every value comes back as what was inserted. Subclasses of the built-in types are

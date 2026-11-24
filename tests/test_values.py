@@ -20,6 +20,18 @@ ROUTE = Route(asn=64512, geo=Geo('LU', 'Centre'), tags=('a', 'b'), extra={'x': 1
 MODEL = Model(asn=15169, owner=Owner(name='Google', since=dt.date(2000, 1, 2)), tags=('t',))
 
 
+class Aliased(pydantic.BaseModel):
+    """Field aliases of every kind; dumped by alias by default."""
+
+    model_config = pydantic.ConfigDict(frozen=True, serialize_by_alias=True)
+    asn: int = pydantic.Field(alias='ASN')
+    name: str = pydantic.Field(validation_alias='Name')
+    country: str = pydantic.Field(serialization_alias='Country')
+
+
+ALIASED = Aliased.model_validate({'ASN': 1, 'Name': 'n', 'country': 'LU'})
+
+
 def roundtrips(value, value_type=None, types_=()):
     """Stores `value` and returns it as seen after insert, bytes, file-less pickle and copy."""
     t = SubnetTreeBuilder(value_type) if value_type else SubnetTreeBuilder()
@@ -47,10 +59,11 @@ def roundtrips(value, value_type=None, types_=()):
         # frozen dataclasses (nested) and pydantic models
         (ROUTE, ROUTE),
         (MODEL, MODEL),
+        (ALIASED, ALIASED),
     ],
 )
 def test_supported_values_roundtrip(value, expected):
-    for result in roundtrips(value, types_=(Route, Geo, Model)):
+    for result in roundtrips(value, types_=(Route, Geo, Model, Aliased)):
         assert result == expected
         assert type(result) is type(expected)
     if isinstance(expected, types.MappingProxyType):

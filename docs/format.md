@@ -47,7 +47,8 @@ A value is a tag byte followed by its payload.
 | 11 | enum member | varint type id, then the member's value |
 
 Type kinds: `1` is a dataclass, rebuilt with `cls(**fields)`; `2` is a pydantic model, stored as
-`model_dump(mode='json')` and rebuilt with `cls.model_validate(fields)`; `3` is an enum, whose
+`model_dump(mode='json', by_alias=False)` (by field name) and rebuilt with
+`cls.model_validate(fields, by_name=True)`; `3` is an enum, whose
 members are stored by value and restored with `cls(value)` (this also restores combined flags).
 Objects (tag 10) refer to dataclasses and models, enum members (tag 11) to enums. The file
 contains only type names. Loading resolves them against the classes passed to `load()` and never imports

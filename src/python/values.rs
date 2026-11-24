@@ -36,6 +36,9 @@ pub struct TypeInfo {
     pub desc: TypeDesc,
     /// Dataclass init fields, in definition order (empty for pydantic models).
     fields: Vec<Py<PyString>>,
+    /// Pydantic models: `model_validate` takes `by_name` (pydantic 2.11+). Models are stored by
+    /// field name, so they are validated by name: field aliases may differ.
+    by_name: bool,
 }
 
 impl TypeInfo {
@@ -44,6 +47,7 @@ impl TypeInfo {
             cls: self.cls.clone_ref(py),
             desc: self.desc.clone(),
             fields: self.fields.iter().map(|f| f.clone_ref(py)).collect(),
+            by_name: self.by_name,
         }
     }
 }
@@ -59,7 +63,7 @@ pub fn classify(cls: &Bound<'_, PyType>) -> PyResult<Option<TypeInfo>> {
     let name = format!("{}.{}", cls.module()?, cls.qualname()?);
     if cls.is_subclass(ENUM.import(py, "enum", "Enum")?)? {
         let desc = TypeDesc { kind: TypeKind::Enum, name: name.into() };
-        return Ok(Some(TypeInfo { cls: cls.clone().unbind(), desc, fields: Vec::new() }));
+        return Ok(Some(TypeInfo { cls: cls.clone().unbind(), desc, fields: Vec::new(), by_name: false }));
     }
     if cls.hasattr(pyo3::intern!(py, "__dataclass_fields__"))? {
         let frozen: bool = cls.getattr("__dataclass_params__")?.getattr("frozen")?.extract()?;
@@ -80,7 +84,7 @@ pub fn classify(cls: &Bound<'_, PyType>) -> PyResult<Option<TypeInfo>> {
             fields.push(field.getattr("name")?.cast_into::<PyString>()?.unbind());
         }
         let desc = TypeDesc { kind: TypeKind::Dataclass, name: name.into() };
-        return Ok(Some(TypeInfo { cls: cls.clone().unbind(), desc, fields }));
+        return Ok(Some(TypeInfo { cls: cls.clone().unbind(), desc, fields, by_name: false }));
     }
     if cls.hasattr(pyo3::intern!(py, "model_validate"))? && cls.hasattr(pyo3::intern!(py, "model_dump"))? {
         let frozen = cls.getattr("model_config")?.call_method1("get", ("frozen",))?.is_truthy()?;
@@ -89,8 +93,11 @@ pub fn classify(cls: &Bound<'_, PyType>) -> PyResult<Option<TypeInfo>> {
                 "pydantic model {name} must be frozen (model_config = ConfigDict(frozen=True)), values are read-only"
             )));
         }
+        let validate = cls.getattr(pyo3::intern!(py, "model_validate"))?;
+        let parameters = py.import("inspect")?.call_method1("signature", (validate,))?.getattr("parameters")?;
+        let by_name = parameters.contains("by_name")?;
         let desc = TypeDesc { kind: TypeKind::Pydantic, name: name.into() };
-        return Ok(Some(TypeInfo { cls: cls.clone().unbind(), desc, fields: Vec::new() }));
+        return Ok(Some(TypeInfo { cls: cls.clone().unbind(), desc, fields: Vec::new(), by_name }));
     }
     Ok(None)
 }
@@ -210,6 +217,9 @@ impl Encoder {
                 TypeKind::Pydantic => {
                     let kwargs = PyDict::new(obj.py());
                     kwargs.set_item("mode", "json")?;
+                    // by field name, also for models configured with `serialize_by_alias`: they
+                    // are validated by name (see `TypeInfo::by_name`)
+                    kwargs.set_item("by_alias", false)?;
                     let data = obj.call_method("model_dump", (), Some(&kwargs))?;
                     self.fields(&data, depth, true)?
                 }
@@ -283,7 +293,14 @@ fn build_inner<'py>(py: Python<'py>, v: &Value, types: &[TypeInfo], plain: bool)
             let cls = info.cls.bind(py);
             match info.desc.kind {
                 TypeKind::Dataclass => cls.call((), Some(&build_dict(py, fields, types, false)?))?,
-                TypeKind::Pydantic => cls.call_method1("model_validate", (build_dict(py, fields, types, true)?,))?,
+                TypeKind::Pydantic => {
+                    let data = build_dict(py, fields, types, true)?;
+                    let kwargs = PyDict::new(py);
+                    if info.by_name {
+                        kwargs.set_item(pyo3::intern!(py, "by_name"), true)?;
+                    }
+                    cls.call_method("model_validate", (data,), Some(&kwargs))?
+                }
                 TypeKind::Enum => unreachable!("objects never refer to enum types"),
             }
         }
