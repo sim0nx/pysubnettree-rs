@@ -138,19 +138,19 @@ Full 2016 routeviews table, IPv4 and IPv6, with AS numbers as values. The table 
 reproduce it.
 
 <!-- bench:start -->
-AMD Ryzen 9 3900X 12-Core Processor, Python 3.13.5, pysubnettree-rs 0.4.1, pysubnettree 0.38.1; 1,000,000 lookups per set, median of 3 passes in each of 3 processes.
+AMD Ryzen 9 3900X 12-Core Processor, Python 3.13.5, pysubnettree-rs 0.5.0, pysubnettree 0.38.1; 1,000,000 lookups per set, median of 3 passes in each of 3 processes.
 
 | | pysubnettree-rs | [pysubnettree](https://github.com/zeek/pysubnettree) |
 |---|---:|---:|
-| Load 644,586 networks | 0.24 s | 0.32 s |
-| Lookup, addresses inside table networks | 156 ns | 1221 ns |
-| Lookup, random addresses | 111 ns | 745 ns |
-| of which Python loop and call overhead | 29 ns | 30 ns |
+| Load 644,586 networks | 0.25 s | 0.33 s |
+| Lookup, addresses inside table networks | 154 ns | 1203 ns |
+| Lookup, random addresses | 107 ns | 786 ns |
+| of which Python loop and call overhead | 31 ns | 29 ns |
 | Memory (RSS increase) | 16 MB | 98 MB |
-| Save to file (size) | 0.013 s (4.3 MB) | n/a |
+| Save to file (size) | 0.012 s (4.3 MB) | n/a |
 | Load from file | 0.031 s | n/a |
-| Load from file, a distinct dataclass per network (35 MB) | 0.201 s | n/a |
-| same, `eager=True` (builds every value object up front) | 2.154 s | n/a |
+| Load from file, a distinct dataclass per network (35 MB) | 0.214 s | n/a |
+| same, `eager=True` (builds every value object up front) | 2.170 s | n/a |
 <!-- bench:end -->
 
 ### Compared to other algorithms
