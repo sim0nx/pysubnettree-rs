@@ -1,6 +1,7 @@
 """Files, bytes and corruption handling."""
 
 import dataclasses
+import enum
 import gc
 import pickle
 import threading
@@ -83,9 +84,33 @@ def test_dump_is_atomic(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == ['tree.pst', 'tree.pst.tmp', 'victim.txt'], 'no temporary file left'
 
 
+def test_unused_types_are_not_saved():
+    """Files only list the classes their values use: loading never asks for others."""
+
+    @dataclasses.dataclass(frozen=True)
+    class Gone:
+        x: int
+
+    class Kept(enum.Enum):
+        A = 1
+
+    b = SubnetTreeBuilder()
+    b['10.0.0.0/8'] = Gone(1)
+    b['11.0.0.0/8'] = Kept.A
+    b['12.0.0.0/8'] = 'plain'
+    del b['10.0.0.0/8']
+    for data in (b.to_bytes(), b.build().to_bytes()):
+        assert b'Gone' not in data
+        t = SubnetTreeRS.from_bytes(data, types=[Kept])
+        assert t['11.0.0.1'] is Kept.A
+        assert t['12.0.0.1'] == 'plain'
+    b['11.0.0.0/8'] = 'replaced'  # the last value of Kept
+    assert SubnetTreeRS.from_bytes(b.to_bytes()).items() == [('11.0.0.0/8', 'replaced'), ('12.0.0.0/8', 'plain')]
+
+
 def test_invalid_and_corrupted_data():
     for data in [b'', b'garbage', b'PYSTREE\x00' + bytes(20)]:
-        with pytest.raises(ValueError, match='subnet tree|checksum|version'):
+        with pytest.raises(ValueError, match=r'subnet tree|checksum|version'):
             SubnetTreeRS.from_bytes(data)
     t = SubnetTreeBuilder()
     t['10.0.0.0/8'] = Route(asn=1, geo=Geo('LU'), extra={'a': 1})

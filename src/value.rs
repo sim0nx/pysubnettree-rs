@@ -442,20 +442,17 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn transcode_fields<S: Sink, F>(
+    fn transcode_fields<S: Sink, M: RefMap<'a>>(
         &mut self,
         out: &mut S,
         depth: usize,
         types: &[TypeDesc],
-        string: &mut F,
-    ) -> Result<(), DecodeError>
-    where
-        F: FnMut(&mut Self) -> Result<u32, DecodeError>,
-    {
+        string: &mut M,
+    ) -> Result<(), DecodeError> {
         let n = self.count()?;
         out.varint(n as u128);
         for _ in 0..n {
-            let id = string(self)?;
+            let id = string.string(self)?;
             out.varint(u128::from(id));
             self.transcode(out, depth + 1, types, string)?;
         }
@@ -463,19 +460,16 @@ impl<'a> Reader<'a> {
     }
 
     /// Validates one value exactly like [`Reader::value`] (same errors, same end position), and
-    /// writes it to `out` in canonical form, without building it. `string` reads a string (an
-    /// id, or an inline string in version 1 data) and returns the id to write: it validates
-    /// and maps the ids. `types` are the registered types.
-    pub fn transcode<S: Sink, F>(
+    /// writes it to `out` in canonical form, without building it. `string` reads a string id and
+    /// returns the id to write: it validates and maps the ids; it also maps the type ids of
+    /// objects and enum members (see [`RefMap`]). `types` are the registered types.
+    pub fn transcode<S: Sink, M: RefMap<'a>>(
         &mut self,
         out: &mut S,
         depth: usize,
         types: &[TypeDesc],
-        string: &mut F,
-    ) -> Result<(), DecodeError>
-    where
-        F: FnMut(&mut Self) -> Result<u32, DecodeError>,
-    {
+        string: &mut M,
+    ) -> Result<(), DecodeError> {
         if depth > MAX_DEPTH {
             return err("values nested too deeply");
         }
@@ -493,7 +487,7 @@ impl<'a> Reader<'a> {
             }
             tag::FLOAT => out.put(self.bytes(8)?),
             tag::STR => {
-                let id = string(self)?;
+                let id = string.string(self)?;
                 out.varint(u128::from(id));
             }
             tag::BYTES => {
@@ -512,13 +506,13 @@ impl<'a> Reader<'a> {
             tag::OBJECT => {
                 let id = self.u32()?;
                 check_type(types, id, false)?;
-                out.varint(u128::from(id));
+                out.varint(u128::from(string.type_id(id)));
                 self.transcode_fields(out, depth, types, string)?;
             }
             tag::ENUM => {
                 let id = self.u32()?;
                 check_type(types, id, true)?;
-                out.varint(u128::from(id));
+                out.varint(u128::from(string.type_id(id)));
                 self.transcode(out, depth + 1, types, string)?;
             }
             t => return err(format!("unknown value tag {t}")),
@@ -549,16 +543,77 @@ pub fn decode(data: &[u8], refs: Refs<'_>) -> Result<Value, DecodeError> {
     Ok(v)
 }
 
+/// What [`Reader::transcode`] does with the references of a value: reads (and validates) a
+/// string id and returns the one to write, and maps type ids (unchanged by default). Closures
+/// reading string ids implement it.
+pub(crate) trait RefMap<'a> {
+    fn string(&mut self, r: &mut Reader<'a>) -> Result<u32, DecodeError>;
+
+    fn type_id(&mut self, id: u32) -> u32 {
+        id
+    }
+}
+
+impl<'a, F: FnMut(&mut Reader<'a>) -> Result<u32, DecodeError>> RefMap<'a> for F {
+    fn string(&mut self, r: &mut Reader<'a>) -> Result<u32, DecodeError> {
+        self(r)
+    }
+}
+
+/// A [`RefMap`] from two plain mappings of string ids and type ids.
+struct MapIds<S, T>(S, T);
+
+impl<S: FnMut(u32) -> u32, T: FnMut(u32) -> u32> RefMap<'_> for MapIds<S, T> {
+    fn string(&mut self, r: &mut Reader<'_>) -> Result<u32, DecodeError> {
+        r.u32().map(&mut self.0)
+    }
+
+    fn type_id(&mut self, id: u32) -> u32 {
+        (self.1)(id)
+    }
+}
+
+/// Writes a valid encoded value to `out` with its string ids mapped by `strings` and its type
+/// ids by `types_map`.
+pub(crate) fn remap_refs(
+    encoded: &[u8],
+    out: &mut Vec<u8>,
+    types: &[TypeDesc],
+    strings: impl FnMut(u32) -> u32,
+    types_map: impl FnMut(u32) -> u32,
+) {
+    let mut map = MapIds(strings, types_map);
+    Reader::new(encoded).transcode(out, 0, types, &mut map).expect("a valid encoded value");
+}
+
 /// Writes a valid encoded value to `out` with its string ids mapped by `map`.
-pub(crate) fn remap_strings(encoded: &[u8], out: &mut Vec<u8>, types: &[TypeDesc], mut map: impl FnMut(u32) -> u32) {
-    let mut string = |r: &mut Reader<'_>| r.u32().map(&mut map);
-    Reader::new(encoded).transcode(out, 0, types, &mut string).expect("a valid encoded value");
+pub(crate) fn remap_strings(encoded: &[u8], out: &mut Vec<u8>, types: &[TypeDesc], map: impl FnMut(u32) -> u32) {
+    remap_refs(encoded, out, types, map, |id| id);
+}
+
+/// Calls `on_string` with every string id and `on_type` with every type id of a valid encoded
+/// value, in order.
+pub(crate) fn visit_refs(
+    encoded: &[u8],
+    types: &[TypeDesc],
+    mut on_string: impl FnMut(u32),
+    mut on_type: impl FnMut(u32),
+) {
+    let strings = |id| {
+        on_string(id);
+        id
+    };
+    let type_ids = |id| {
+        on_type(id);
+        id
+    };
+    let mut map = MapIds(strings, type_ids);
+    Reader::new(encoded).transcode(&mut Discard, 0, types, &mut map).expect("a valid encoded value");
 }
 
 /// Calls `f` with every string id of a valid encoded value, in order.
-pub(crate) fn visit_strings(encoded: &[u8], types: &[TypeDesc], mut f: impl FnMut(u32)) {
-    let mut string = |r: &mut Reader<'_>| r.u32().inspect(|&id| f(id));
-    Reader::new(encoded).transcode(&mut Discard, 0, types, &mut string).expect("a valid encoded value");
+pub(crate) fn visit_strings(encoded: &[u8], types: &[TypeDesc], f: impl FnMut(u32)) {
+    visit_refs(encoded, types, f, |_| {});
 }
 
 /// The encodings of all values of a store, concatenated in one buffer: no allocation (and no

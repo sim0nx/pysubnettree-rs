@@ -32,7 +32,8 @@ use crate::strings::{StringSet, Strings};
 use crate::table::{Addr, PrefixTable};
 use crate::tree::Tree;
 use crate::value::{
-    DecodeError, Encodings, Reader, TypeDesc, TypeKind, ValueStore, err, put_len, put_str, put_varint, visit_strings,
+    DecodeError, Encodings, Reader, TypeDesc, TypeKind, ValueStore, err, put_len, put_str, put_varint, remap_refs,
+    visit_refs,
 };
 
 pub const MAGIC: &[u8; 8] = b"PYSTREE\0";
@@ -137,29 +138,40 @@ pub fn write<P, W: Write>(tree: &Tree<P>, out: W) -> io::Result<W> {
         }
     }
 
+    // the types and strings used by the written values, renumbered in order of first use: a
+    // type whose values are all gone is not written (loading would ask for its class)
+    let types = tree.types();
+    let all = tree.strings();
+    let mut type_ids = vec![u32::MAX; types.len()];
+    let mut used_types = Vec::new();
+    let mut string_ids = vec![u32::MAX; all.len()];
+    let mut strings = Vec::new();
+    let first_use = |ids: &mut Vec<u32>, used: &mut Vec<u32>, id: u32| {
+        let new = &mut ids[id as usize];
+        if *new == u32::MAX {
+            *new = u32::try_from(used.len()).expect("ids fit u32");
+            used.push(id);
+        }
+    };
+    for &id in &order {
+        visit_refs(
+            tree.encoded(id),
+            types,
+            |s| first_use(&mut string_ids, &mut strings, s),
+            |t| first_use(&mut type_ids, &mut used_types, t),
+        );
+    }
+
     let mut out = Output::new(out);
     out.buf.extend_from_slice(MAGIC);
     out.buf.extend_from_slice(&VERSION.to_le_bytes());
     out.buf.extend_from_slice(&0u16.to_le_bytes());
-    put_len(&mut out.buf, tree.types().len());
-    for t in tree.types() {
+    put_len(&mut out.buf, used_types.len());
+    for &t in &used_types {
+        let t = &types[t as usize];
         out.buf.push(t.kind as u8);
         put_str(&mut out.buf, &t.name);
         out.spill()?;
-    }
-    // the strings used by the written values, renumbered in order of first use
-    let types = tree.types();
-    let all = tree.strings();
-    let mut string_ids = vec![u32::MAX; all.len()];
-    let mut strings = Vec::new();
-    for &id in &order {
-        visit_strings(tree.encoded(id), types, |s| {
-            let new = &mut string_ids[s as usize];
-            if *new == u32::MAX {
-                *new = u32::try_from(strings.len()).expect("string ids fit u32");
-                strings.push(s);
-            }
-        });
     }
     put_len(&mut out.buf, strings.len());
     for &s in &strings {
@@ -169,9 +181,8 @@ pub fn write<P, W: Write>(tree: &Tree<P>, out: W) -> io::Result<W> {
     }
     drop(strings);
     put_len(&mut out.buf, order.len());
-    let mut string = |r: &mut Reader<'_>| r.u32().map(|id| string_ids[id as usize]);
     for &id in &order {
-        Reader::new(tree.encoded(id)).transcode(&mut out.buf, 0, types, &mut string).expect("a valid encoded value");
+        remap_refs(tree.encoded(id), &mut out.buf, types, |s| string_ids[s as usize], |t| type_ids[t as usize]);
         out.spill()?;
     }
     drop(order);
@@ -264,8 +275,11 @@ pub fn decode<P: Default>(data: &[u8]) -> Result<Tree<P>, DecodeError> {
     }
     let payloads = std::iter::repeat_with(P::default).take(values.len()).collect();
     let mut tree = Tree { v4, v6, values: ValueStore::from_encodings(values, payloads), types, strings };
-    // a hand-crafted file may contain unreferenced values, harmless but a waste of memory
+    // a hand-crafted file may contain unreferenced values, harmless but a waste of memory; and
+    // files of 0.5.0 and earlier may list types none of their values use: dropped, so that
+    // loading does not ask for their classes
     drop(tree.compact_values(true));
+    tree.compact_types();
     Ok(tree)
 }
 
@@ -486,6 +500,35 @@ mod tests {
         }
     }
 
+    /// Types whose values are all gone are not written, the others are renumbered; files that
+    /// list unused types (written by 0.5.0 and earlier) load without them.
+    #[test]
+    fn unused_types() {
+        const ENUM: u8 = 11;
+        let mut t = Tree::new();
+        let a = t.register_type(&TypeDesc { kind: TypeKind::Dataclass, name: "m.A".into() });
+        let b = t.register_type(&TypeDesc { kind: TypeKind::Enum, name: "m.B".into() });
+        let obj = Value::Object(a, vec![("x".into(), Value::Int(1))].into());
+        let member = Value::Enum(b, Box::new(Value::Int(2)));
+        t.insert_value(parse_network("10.0.0.0/8").unwrap(), obj);
+        t.insert_value(parse_network("11.0.0.0/8").unwrap(), Value::Seq(vec![member].into()));
+        let _ = t.compile();
+        assert_eq!(load(&encode(&t)).unwrap().types().len(), 2);
+        t.remove(parse_network("10.0.0.0/8").unwrap());
+        let _ = t.compile();
+        assert_eq!(t.types().len(), 2, "the tree itself keeps its types");
+        let loaded = load(&encode(&t)).unwrap();
+        assert_eq!(loaded.types(), [TypeDesc { kind: TypeKind::Enum, name: "m.B".into() }]);
+        let (_, v) = loaded.entries().next().unwrap();
+        assert_eq!(*v.payload(), Value::Seq(vec![Value::Enum(0, Box::new(Value::Int(2)))].into()));
+
+        // a crafted (or old) file: an unused type before the used one
+        let body: &[u8] = &[2, 1, 1, b'U', 3, 1, b'E', 0, 1, ENUM, 1, 3, 2, 1, 0, 8, 0, 0];
+        let loaded = load(&file(VERSION, body)).unwrap();
+        assert_eq!(loaded.types(), [TypeDesc { kind: TypeKind::Enum, name: "E".into() }]);
+        assert_eq!(loaded.decode(loaded.encoded(0)).unwrap(), Value::Enum(0, Box::new(Value::Int(1))));
+    }
+
     /// A crafted file with many types is checked in linear time (pairwise comparisons of
     /// 200,000 types would take minutes), and a duplicate among them is still found.
     #[test]
@@ -503,7 +546,7 @@ mod tests {
         };
         let n = 200_000;
         let tree = decode::<()>(&types(&mut (0..n).map(|i| format!("m.T{i}")))).unwrap();
-        assert_eq!(tree.types().len(), n);
+        assert!(tree.types().is_empty(), "no value uses them: dropped");
         let dup = decode::<()>(&types(&mut (0..n).map(|i| format!("m.T{}", i.min(n - 2)))));
         assert_eq!(dup.unwrap_err().to_string(), "duplicate type");
     }

@@ -7,7 +7,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::strings::{StringSet, Strings};
 use crate::table::{Addr, PrefixTable};
 use crate::value::{
-    DecodeError, Refs, TypeDesc, Value, ValueRef, ValueStore, decode, encode, remap_strings, visit_strings,
+    DecodeError, Refs, TypeDesc, Value, ValueRef, ValueStore, decode, encode, remap_refs, remap_strings, visit_refs,
+    visit_strings,
 };
 
 /// An IP network (network address with host bits cleared, prefix length).
@@ -373,6 +374,34 @@ impl<P> Tree<P> {
             strings.iter().zip(&used).map(|(s, &u)| if u { kept.push(s) } else { u32::MAX }).collect();
         self.values.rewrite_encodings(|e, out| remap_strings(e, out, types, |id| remap[id as usize]));
         self.strings = StringSet::new(kept);
+    }
+
+    /// Removes registered types no longer used by any value and renumbers the rest. Only for a
+    /// tree whose type ids are not referenced from outside (a freshly decoded one): the Python
+    /// bindings keep a class per type id.
+    pub(crate) fn compact_types(&mut self) {
+        let types = &self.types;
+        let mut used = vec![false; types.len()];
+        for v in self.values.iter() {
+            visit_refs(v.encoded(), types, |_| {}, |id| used[id as usize] = true);
+        }
+        if used.iter().all(|&u| u) {
+            return;
+        }
+        let mut kept = Vec::new();
+        let remap: Vec<u32> = types
+            .iter()
+            .zip(&used)
+            .map(|(t, &u)| {
+                if !u {
+                    return u32::MAX;
+                }
+                kept.push(t.clone());
+                u32::try_from(kept.len() - 1).expect("type ids fit u32")
+            })
+            .collect();
+        self.values.rewrite_encodings(|e, out| remap_refs(e, out, types, |s| s, |t| remap[t as usize]));
+        self.types = kept;
     }
 
     /// Replaces the payloads (e.g. after decoding from disk). `make` gets the value id, its

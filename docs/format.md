@@ -50,8 +50,9 @@ Type kinds: `1` is a dataclass, rebuilt with `cls(**fields)`; `2` is a pydantic 
 `model_dump(mode='json', by_alias=False)` (by field name) and rebuilt with
 `cls.model_validate(fields, by_name=True)`; `3` is an enum, whose
 members are stored by value and restored with `cls(value)` (this also restores combined flags).
-Objects (tag 10) refer to dataclasses and models, enum members (tag 11) to enums. The file
-contains only type names. Loading resolves them against the classes passed to `load()` and never imports
+Objects (tag 10) refer to dataclasses and models, enum members (tag 11) to enums. A file lists
+only the types its values use, numbered in order of first use (files of 0.5.0 and earlier may
+list more: loading ignores types no value uses). The file contains only type names. Loading resolves them against the classes passed to `load()` and never imports
 anything.
 
 Each value is stored in its canonical encoding, so equal values have identical bytes. A file with
