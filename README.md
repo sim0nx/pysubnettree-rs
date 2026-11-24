@@ -105,7 +105,7 @@ first.
 | `build()` | | ✓ | An immutable `SubnetTreeRS` with a copy of the contents. |
 | `to_builder()` | ✓ | | A modifiable copy. |
 | `insert(network, value=None)` / `b[network] = value` | | ✓ | Add or replace a network. Host bits are ignored. |
-| `insert_many(mapping_or_pairs)` | | ✓ | Bulk insert, faster than repeated `insert`. |
+| `insert_many(mapping_or_pairs)` | | ✓ | Bulk insert, faster than repeated `insert`; all or nothing. |
 | `remove(network)` / `del b[network]`, `clear()` | | ✓ | Remove networks. |
 | `t[key]` | ✓ | ✓ | Value of the longest match, `KeyError` if there is none. |
 | `get(key, default=None)` | ✓ | ✓ | Value of the longest match, or `default`. |

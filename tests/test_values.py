@@ -217,6 +217,47 @@ def test_unsupported_values():
         t['12.0.0.0/8'] = impostor('LU')
 
 
+def test_values_must_survive_rebuilding():
+    """Values are rebuilt from their fields: inputs that change on rebuilding are rejected."""
+
+    @dataclasses.dataclass(frozen=True)
+    class Shout:
+        word: str
+
+        def __post_init__(self):
+            object.__setattr__(self, 'word', self.word + '!')  # 'a!' is rebuilt as 'a!!'
+
+    @dataclasses.dataclass(frozen=True)
+    class Lower:
+        word: str
+        score: float = float('nan')
+
+        def __post_init__(self):
+            object.__setattr__(self, 'word', self.word.lower())  # idempotent: fine
+
+    class Counter(pydantic.BaseModel):
+        model_config = pydantic.ConfigDict(frozen=True)
+        n: int
+
+        @pydantic.field_validator('n')
+        @classmethod
+        def bump(cls, v: int) -> int:
+            return v + 1
+
+    t = SubnetTreeBuilder()
+    for value in (Shout('a'), [1, {'x': Shout('a')}], Counter(n=1)):
+        with pytest.raises(ValueError, match='changes when it is rebuilt'):
+            t['10.0.0.0/8'] = value
+        with pytest.raises(ValueError, match='changes when it is rebuilt'):
+            t.insert_many([('10.0.0.0/8', value)])
+    assert len(t) == 0
+    t['10.0.0.0/8'] = Lower('MiXed')
+    found = t['10.0.0.1']
+    assert found is not None
+    assert found.word == 'mixed'
+    assert found.score != found.score, 'a NaN field is not mistaken for a change'
+
+
 def test_insert_many_reuses_objects():
     calls = 0
 
@@ -232,7 +273,7 @@ def test_insert_many_reuses_objects():
     shared = Counted(asn=1)
     t = SubnetTreeBuilder(value_type=Counted)
     assert t.insert_many((f'10.{i}.0.0/16', shared) for i in range(256)) == 256
-    assert calls == 1, 'the same object is converted once per call'
+    assert calls == 2, 'the same object is converted once per call, and its rebuilt copy once to compare'
     assert t['10.7.0.1'] == shared
 
 

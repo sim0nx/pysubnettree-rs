@@ -15,7 +15,8 @@ builder.insert('10.0.0.0/8', {'asn': 64512})
 builder['192.0.2.0/24'] = 'documentation'   # same as insert
 builder.insert('2001:db8::/32')              # no value, lookups return None
 
-# bulk loading is faster: from a mapping or an iterable of (network, value) pairs
+# bulk loading is faster: from a mapping or an iterable of (network, value) pairs; all or
+# nothing: if a pair is invalid or the iterable raises, the builder is left as it was
 builder.insert_many({'198.51.100.0/24': 1, '203.0.113.0/24': 2})
 builder.insert_many((row.network, row.value) for row in rows)
 

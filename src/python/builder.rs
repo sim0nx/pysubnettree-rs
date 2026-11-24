@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use pyo3::exceptions::PyTypeError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::RwLockExt;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyMapping, PyString, PyTuple, PyType};
@@ -14,8 +14,8 @@ use super::data::{Collected, Data, Payload, Slot, check_value_type, missing, rep
 use super::frozen::SubnetTreeRS;
 use super::keys::{extract_key, extract_network};
 use super::values::{Encoder, TypeInfo, build, is_cacheable};
-use crate::tree::Network;
-use crate::value::Value;
+use crate::tree::{Network, Tree};
+use crate::value::{Value, encode};
 
 /// Number of `(network, value)` pairs converted before taking the lock in `insert_many`.
 const INSERT_CHUNK: usize = 16 * 1024;
@@ -36,6 +36,51 @@ enum Item {
     Shared(Arc<Prepared>),
 }
 
+/// The changes of one `insert_many` call, to undo them if it fails: the networks it added, and
+/// the previous values of the networks it replaced (decoded: value ids may change when another
+/// thread compiles the builder between two chunks). New networks are the common case and cost
+/// only their address: 5 bytes (IPv4) or 17 bytes (IPv6) plus padding.
+#[derive(Default)]
+struct Undo {
+    added_v4: Vec<(u32, u8)>,
+    added_v6: Vec<(u128, u8)>,
+    replaced: HashMap<Network, Value>,
+}
+
+impl Undo {
+    /// Records the state of `net` before it is changed, the first time it is changed.
+    fn record(&mut self, tree: &Tree<Slot>, net: Network) {
+        let Some(previous) = tree.get_exact(net) else {
+            match net {
+                Network::V4(a, l) => self.added_v4.push((a, l)),
+                Network::V6(a, l) => self.added_v6.push((a, l)),
+            }
+            return;
+        };
+        // a network added by this call and changed again is removed anyway: recording it here
+        // too is harmless (replaced networks are restored first, added ones removed after)
+        if let std::collections::hash_map::Entry::Vacant(e) = self.replaced.entry(net) {
+            e.insert(tree.decode(previous.encoded()).expect("stored values are valid"));
+        }
+    }
+
+    /// Restores the recorded state. Runs no Python code (values get empty cells: their objects
+    /// are rebuilt on first use unless the value is still stored with its object).
+    fn apply(self, tree: &mut Tree<Slot>) {
+        for (net, value) in self.replaced {
+            let encoded = tree.encode(&value, None);
+            let (id, _) = tree.add_value(&encoded, Slot::new());
+            tree.insert_id(net, id);
+        }
+        for (a, l) in self.added_v4 {
+            tree.remove(Network::V4(a, l));
+        }
+        for (a, l) in self.added_v6 {
+            tree.remove(Network::V6(a, l));
+        }
+    }
+}
+
 fn has_objects(v: &Value) -> bool {
     match v {
         Value::Object(..) | Value::Enum(..) => true,
@@ -43,6 +88,19 @@ fn has_objects(v: &Value) -> bool {
         Value::Map(fields) => fields.iter().any(|(_, v)| has_objects(v)),
         _ => false,
     }
+}
+
+/// True if two values are identical: same types and contents, floats compared by their bits (a
+/// NaN equals itself, unlike in Python). Compares their encodings, with one string numbering for
+/// both.
+fn same_value(a: &Value, b: &Value) -> bool {
+    let mut ids: HashMap<String, u32> = HashMap::new();
+    let mut intern = |s: &str| {
+        let next = u32::try_from(ids.len()).expect("few strings");
+        *ids.entry(s.to_owned()).or_insert(next)
+    };
+    let a = encode(a, None, &mut intern);
+    a == encode(b, None, &mut intern)
 }
 
 /// Exact instances of immutable scalar types are their own read-only representation.
@@ -129,18 +187,29 @@ impl SubnetTreeBuilder {
         if has_objects(&converted) {
             // the object is built on first use; building it once now raises errors (e.g. of a
             // `__post_init__` or a validator) here rather than in a later lookup
-            drop(build(py, &converted, &encoder.types)?);
+            let rebuilt = build(py, &converted, &encoder.types)?;
+            // and it must be what was inserted: a `__post_init__` or validator which changes its
+            // input would change the value again every time it is rebuilt from its fields
+            if !same_value(&encoder.encode(&rebuilt)?, &converted) {
+                return Err(PyValueError::new_err(format!(
+                    "{} changes when it is rebuilt from its fields (got {}); values whose \
+                     __post_init__ or validators change their input can not be stored",
+                    value.repr()?,
+                    rebuilt.repr()?
+                )));
+            }
         }
         Ok(Prepared { value: converted, payload })
     }
 
-    /// Stores prepared values. Returns the number of new networks and the payloads to drop
-    /// after the lock is released (unused duplicates).
+    /// Stores prepared values, recording the changes in `undo` if given. Returns the number of
+    /// new networks and the payloads to drop after the lock is released (unused duplicates).
     fn store(
         &self,
         py: Python<'_>,
         local_types: &[TypeInfo],
         items: impl IntoIterator<Item = (Network, Item)>,
+        mut undo: Option<&mut Undo>,
     ) -> PyResult<(usize, Vec<Slot>)> {
         let mut guard = self.write(py);
         let data = &mut *guard;
@@ -159,9 +228,10 @@ impl SubnetTreeBuilder {
                     unused.extend(payload);
                     id
                 }
-                Item::Shared(p) => match shared.get(&Arc::as_ptr(&p)) {
-                    Some(&id) => id,
-                    None => {
+                Item::Shared(p) => {
+                    if let Some(&id) = shared.get(&Arc::as_ptr(&p)) {
+                        id
+                    } else {
                         let encoded = data.tree.encode(&p.value, Some(&map));
                         let payload = p.payload.as_ref().map(|p| p.clone_ref(py));
                         let (id, payload) = data.tree.add_value(&encoded, slot(payload));
@@ -169,11 +239,57 @@ impl SubnetTreeBuilder {
                         shared.insert(Arc::as_ptr(&p), id);
                         id
                     }
-                },
+                }
             };
+            if let Some(undo) = undo.as_deref_mut() {
+                undo.record(&data.tree, net);
+            }
             added += usize::from(data.tree.insert_id(net, id));
         }
+        drop(guard);
         Ok((added, unused))
+    }
+
+    /// The work of `insert_many`, recording its changes in `undo`.
+    fn insert_all(&self, py: Python<'_>, items: &Bound<'_, PyAny>, undo: &mut Undo) -> PyResult<usize> {
+        let items = if let Ok(m) = items.cast::<PyMapping>() { m.items()?.into_any() } else { items.clone() };
+        let mut encoder = Encoder::default();
+        // frozen dataclass/model instances are often reused for many networks: convert each
+        // object once per chunk (the reference keeps the object, and so its id, alive). Not
+        // once per call: that would keep every object and its conversion alive until the end.
+        let mut cache: HashMap<usize, (Py<PyAny>, Arc<Prepared>)> = HashMap::new();
+        let mut added = 0;
+        let mut chunk = Vec::with_capacity(INSERT_CHUNK);
+        for item in items.try_iter()? {
+            let (network, value): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item?.extract().map_err(|_| {
+                PyTypeError::new_err("insert_many expects a mapping or an iterable of (network, value) pairs")
+            })?;
+            let net = extract_network(&network)?;
+            let prepared = if is_cacheable(&value) {
+                let key = value.as_ptr() as usize;
+                if let Some((_, p)) = cache.get(&key) {
+                    Item::Shared(Arc::clone(p))
+                } else {
+                    let p = Arc::new(self.prepare(py, &mut encoder, &value)?);
+                    cache.insert(key, (value.unbind(), Arc::clone(&p)));
+                    Item::Shared(p)
+                }
+            } else {
+                Item::Owned(self.prepare(py, &mut encoder, &value)?)
+            };
+            chunk.push((net, prepared));
+            if chunk.len() == INSERT_CHUNK {
+                // `drain`, not `into_iter`: the buffer is reused for the next chunk
+                #[expect(clippy::iter_with_drain, reason = "keeps the chunk buffer allocated")]
+                let (n, unused) = self.store(py, &encoder.types, chunk.drain(..), Some(&mut *undo))?;
+                added += n;
+                drop(unused);
+                cache.clear();
+            }
+        }
+        let (n, unused) = self.store(py, &encoder.types, chunk, Some(undo))?;
+        drop(unused);
+        Ok(added + n)
     }
 }
 
@@ -213,7 +329,7 @@ impl SubnetTreeBuilder {
         let mut encoder = Encoder::default();
         let none = py.None().into_bound(py);
         let prepared = self.prepare(py, &mut encoder, value.unwrap_or(&none))?;
-        let (added, unused) = self.store(py, &encoder.types, [(net, Item::Owned(prepared))])?;
+        let (added, unused) = self.store(py, &encoder.types, [(net, Item::Owned(prepared))], None)?;
         drop(unused);
         Ok(added == 1)
     }
@@ -221,44 +337,17 @@ impl SubnetTreeBuilder {
     /// Adds many networks at once from a mapping ``{network: value}`` or an iterable of
     /// ``(network, value)`` pairs. Faster than calling :meth:`insert` repeatedly.
     ///
+    /// All or nothing: if a pair is invalid (or the iterable raises), the networks added or
+    /// replaced so far are restored and the error is raised.
+    ///
     /// Returns the number of networks which were not in the builder before.
     fn insert_many(&self, py: Python<'_>, items: &Bound<'_, PyAny>) -> PyResult<usize> {
-        let items = if let Ok(m) = items.cast::<PyMapping>() { m.items()?.into_any() } else { items.clone() };
-        let mut encoder = Encoder::default();
-        // frozen dataclass/model instances are often reused for many networks: convert each
-        // object once per chunk (the reference keeps the object, and so its id, alive). Not
-        // once per call: that would keep every object and its conversion alive until the end.
-        let mut cache: HashMap<usize, (Py<PyAny>, Arc<Prepared>)> = HashMap::new();
-        let mut added = 0;
-        let mut chunk = Vec::with_capacity(INSERT_CHUNK);
-        for item in items.try_iter()? {
-            let (network, value): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item?.extract().map_err(|_| {
-                PyTypeError::new_err("insert_many expects a mapping or an iterable of (network, value) pairs")
-            })?;
-            let net = extract_network(&network)?;
-            let prepared = if is_cacheable(&value) {
-                let key = value.as_ptr() as usize;
-                if let Some((_, p)) = cache.get(&key) {
-                    Item::Shared(Arc::clone(p))
-                } else {
-                    let p = Arc::new(self.prepare(py, &mut encoder, &value)?);
-                    cache.insert(key, (value.unbind(), Arc::clone(&p)));
-                    Item::Shared(p)
-                }
-            } else {
-                Item::Owned(self.prepare(py, &mut encoder, &value)?)
-            };
-            chunk.push((net, prepared));
-            if chunk.len() == INSERT_CHUNK {
-                let (n, unused) = self.store(py, &encoder.types, chunk.drain(..))?;
-                added += n;
-                drop(unused);
-                cache.clear();
-            }
+        let mut undo = Undo::default();
+        let result = self.insert_all(py, items, &mut undo);
+        if result.is_err() {
+            undo.apply(&mut self.write(py).tree);
         }
-        let (n, unused) = self.store(py, &encoder.types, chunk)?;
-        drop(unused);
-        Ok(added + n)
+        result
     }
 
     fn __setitem__(&self, py: Python<'_>, network: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {

@@ -160,6 +160,24 @@ def test_insert_many_and_interleaving():
         with pytest.raises((TypeError, ValueError), match=match):
             t.insert_many(bad)  # type: ignore[arg-type]
         assert len(t) == before, 'nothing is stored if a chunk fails'
+
+    # all or nothing across chunks: added networks are removed again, replaced ones restored
+    before_items = t.items()
+
+    def pairs():
+        yield '10.0.0.0/8', 'replaced'
+        yield '99.0.0.0/8', 'new'
+        yield from ((f'{150 + (i >> 16)}.{(i >> 8) & 255}.{i & 255}.0/24', i) for i in range(n))
+        yield '2001:db8::/32', 'v6'
+        yield '10.0.0.0/8', 'again'  # the same network twice
+        raise RuntimeError('source failed')
+
+    with pytest.raises(RuntimeError, match='source failed'):
+        t.insert_many(pairs())
+    assert t.items() == before_items
+    with pytest.raises(TypeError, match='unsupported value type'):
+        t.insert_many([*((f'150.{i >> 8}.{i & 255}.0/24', i) for i in range(20_000)), ('11.0.0.0/8', object())])
+    assert t.items() == before_items
     # lookups between single inserts see every insert (each lookup recompiles)
     t = SubnetTreeBuilder()
     for i in range(100):
