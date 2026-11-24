@@ -23,6 +23,7 @@
 //! depth, UTF-8), so a corrupted or malicious file results in an error, never in a panic or an
 //! inconsistent tree.
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 
 use xxhash_rust::xxh3::{Xxh3Default, xxh3_64, xxh3_64_with_seed};
@@ -242,12 +243,14 @@ pub fn decode<P: Default>(data: &[u8]) -> Result<Tree<P>, DecodeError> {
         let Some(kind) = TypeKind::from_u8(r.u8()?) else {
             return err("unknown type kind");
         };
-        let desc = TypeDesc { kind, name: r.str()?.into() };
-        if types.contains(&desc) {
-            return err("duplicate type");
-        }
-        types.push(desc);
+        types.push(TypeDesc { kind, name: r.str()?.into() });
     }
+    // not pairwise: a crafted file with many types would take quadratic time
+    let mut seen = HashSet::with_capacity(types.len());
+    if !types.iter().all(|t| seen.insert(t)) {
+        return err("duplicate type");
+    }
+    drop(seen);
 
     // the values are validated without building them, and copied in canonical form
     let (strings, values) = decode_values(&mut r, &types)?;
@@ -478,5 +481,27 @@ mod tests {
         for version in [0, 1, 2, VERSION + 1] {
             assert!(decode::<()>(&file(version, &[0, 0, 0, 0, 0])).is_err(), "version {version}");
         }
+    }
+
+    /// A crafted file with many types is checked in linear time (pairwise comparisons of
+    /// 200,000 types would take minutes), and a duplicate among them is still found.
+    #[test]
+    fn many_types() {
+        let types = |names: &mut dyn Iterator<Item = String>| {
+            let names: Vec<String> = names.collect();
+            let mut body = Vec::new();
+            put_len(&mut body, names.len());
+            for name in &names {
+                body.push(TypeKind::Dataclass as u8);
+                put_str(&mut body, name);
+            }
+            body.extend_from_slice(&[0, 0, 0, 0]); // strings | values | ipv4 | ipv6
+            file(VERSION, &body)
+        };
+        let n = 200_000;
+        let tree = decode::<()>(&types(&mut (0..n).map(|i| format!("m.T{i}")))).unwrap();
+        assert_eq!(tree.types().len(), n);
+        let dup = decode::<()>(&types(&mut (0..n).map(|i| format!("m.T{}", i.min(n - 2)))));
+        assert_eq!(dup.unwrap_err().to_string(), "duplicate type");
     }
 }
