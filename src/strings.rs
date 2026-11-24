@@ -57,15 +57,24 @@ impl Strings {
         })
     }
 
-    /// Appends a string (without checking whether it exists), returns its id.
+    /// Appends a string (without checking whether it exists), returns its id. `None`, and nothing
+    /// changed, if the strings would take more than 4 GiB or there would be more than `u32::MAX`
+    /// strings.
+    pub fn try_push(&mut self, s: &str) -> Option<u32> {
+        let (id, end) = next_slot(self.ends.len(), self.data.len(), s.len())?;
+        // checked before anything is changed: a failed push leaves consistent strings behind
+        self.data.push_str(s);
+        self.ends.push(end);
+        Some(id)
+    }
+
+    /// Like [`Strings::try_push`].
     ///
     /// # Panics
-    /// If the strings take more than 4 GiB, or there are more than `u32::MAX` strings.
+    /// If the strings would take more than 4 GiB, or there would be more than `u32::MAX`
+    /// strings. Nothing is changed then.
     pub fn push(&mut self, s: &str) -> u32 {
-        let id = u32::try_from(self.ends.len()).expect("too many distinct strings");
-        self.data.push_str(s);
-        self.ends.push(u32::try_from(self.data.len()).expect("distinct strings exceed 4 GiB"));
-        id
+        self.try_push(s).expect("distinct strings exceed 4 GiB or u32::MAX strings")
     }
 
     fn shrink(&mut self) {
@@ -78,6 +87,14 @@ impl Strings {
     pub fn memory_usage(&self) -> usize {
         self.data.capacity() + self.ends.capacity() * size_of::<u32>()
     }
+}
+
+/// Id and end offset of a string of `len` bytes appended to `count` strings taking `used` bytes,
+/// `None` if either does not fit a `u32`.
+fn next_slot(count: usize, used: usize, len: usize) -> Option<(u32, u32)> {
+    let id = u32::try_from(count).ok()?;
+    let end = u32::try_from(used.checked_add(len)?).ok()?;
+    Some((id, end))
 }
 
 /// Index of [`Strings`] by content, to find the id of a string.
@@ -176,6 +193,17 @@ impl StringSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limits() {
+        let max = u32::MAX as usize;
+        assert_eq!(next_slot(0, 0, 3), Some((0, 3)));
+        assert_eq!(next_slot(7, max - 3, 3), Some((7, u32::MAX)));
+        assert_eq!(next_slot(7, max - 3, 4), None, "past 4 GiB");
+        assert_eq!(next_slot(max, 0, 0), Some((u32::MAX, 0)));
+        assert_eq!(next_slot(max + 1, 0, 0), None, "too many strings");
+        assert_eq!(next_slot(0, usize::MAX, 1), None, "overflow");
+    }
 
     #[test]
     fn interning() {

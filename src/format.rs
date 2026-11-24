@@ -283,7 +283,10 @@ fn decode_values(r: &mut Reader<'_>, types: &[TypeDesc]) -> Result<(StringSet, V
     }
     let mut strings = Strings::new();
     for s in items {
-        strings.push(s);
+        // only reachable with files of more than 4 GiB: an error, never a panic
+        if strings.try_push(s).is_none() {
+            return err("strings exceed 4 GiB");
+        }
     }
     // strings are numbered in order of first use: each id is a used one, or the next one
     let mut next = 0;
