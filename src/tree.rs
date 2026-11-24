@@ -384,10 +384,24 @@ impl<P> Tree<P> {
     pub(crate) fn compact_types(&mut self) {
         let types = &self.types;
         let mut used = vec![false; types.len()];
+        let mut missing = types.len();
+        // usually every type is seen in the first values: stop walking them then
         for v in self.values.iter() {
-            visit_refs(v.encoded(), types, |_| {}, |id| used[id as usize] = true);
+            if missing == 0 {
+                return;
+            }
+            visit_refs(
+                v.encoded(),
+                types,
+                |_| {},
+                |id| {
+                    if !std::mem::replace(&mut used[id as usize], true) {
+                        missing -= 1;
+                    }
+                },
+            );
         }
-        if used.iter().all(|&u| u) {
+        if missing == 0 {
             return;
         }
         let mut kept = Vec::new();
