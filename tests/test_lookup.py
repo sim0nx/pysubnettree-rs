@@ -122,6 +122,28 @@ def test_mutations():
     t['10.0.0.0/8'] = 1
     assert t['10.0.0.1'] == 1
 
+    # an interface is an address and a network: lookups use its address, methods taking an exact
+    # network reject it instead of silently dropping its prefix
+    tree = t.build()
+    for iface in (ipaddress.ip_interface('10.1.2.3/24'), ipaddress.ip_interface('2001:db8::1/64')):
+        for operation in (
+            t.insert,
+            lambda n: t.__setitem__(n, 1),
+            lambda n: t.insert_many([(n, 1)]),
+            t.remove,
+            t.__delitem__,
+            t.has_network,
+            t.get_exact,
+            tree.has_network,
+            tree.get_exact,
+        ):
+            with pytest.raises(TypeError, match=r'interface .*: pass its \.network or its \.ip'):
+                operation(iface)
+    assert len(t) == 1
+    assert t[ipaddress.ip_interface('10.1.2.3/24')] == tree[ipaddress.ip_interface('10.1.2.3/24')] == 1
+    t[ipaddress.ip_interface('10.1.2.3/24').network] = 2
+    assert t.get_exact('10.1.2.0/24') == 2
+
 
 def test_insert_many_and_interleaving():
     t = SubnetTreeBuilder()

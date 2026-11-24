@@ -4,7 +4,8 @@ use std::net::IpAddr;
 
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyString};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyBytes, PyString, PyType};
 
 use crate::tree::{Address, Network, ParseError, ip_from_packed, parse_address, parse_network};
 
@@ -72,10 +73,29 @@ pub fn extract_key(obj: &Bound<'_, PyAny>) -> PyResult<Key> {
     extract_ipaddress(obj)
 }
 
-/// Network used by mutations: a plain address is a host route.
+static IPV4_INTERFACE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static IPV6_INTERFACE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+/// True for `ipaddress.IPv4Interface` / `IPv6Interface` objects.
+fn is_interface(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let py = obj.py();
+    Ok(obj.is_instance(IPV4_INTERFACE.import(py, "ipaddress", "IPv4Interface")?)?
+        || obj.is_instance(IPV6_INTERFACE.import(py, "ipaddress", "IPv6Interface")?)?)
+}
+
+/// Network used by mutations and exact matches: a plain address is a host route.
+///
+/// `ipaddress` interfaces are rejected: one is an address and a network at once. Lookups treat
+/// it as its address, but inserting it as a host route would silently drop its prefix.
 pub fn extract_network(obj: &Bound<'_, PyAny>) -> PyResult<Network> {
     if let Ok(s) = obj.cast::<PyString>() {
         return Ok(parse_network(s.to_str()?)?);
+    }
+    if is_interface(obj)? {
+        return Err(PyTypeError::new_err(format!(
+            "expected a network, got the interface {}: pass its .network or its .ip",
+            obj.str()?
+        )));
     }
     extract_key(obj).map(Key::network)
 }

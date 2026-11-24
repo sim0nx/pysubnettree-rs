@@ -24,7 +24,9 @@ del builder              # free the builder once it is no longer needed
 ```
 
 Networks and lookup keys can also be given as `ipaddress` objects or as packed `bytes` (4 or 16
-bytes).
+bytes). An `ipaddress` interface (`ip_interface('10.1.2.3/24')`) is both: as a lookup key it is
+its address, while `insert`, `remove`, `has_network` and `get_exact` reject it with `TypeError`
+rather than store a host route without its prefix. Pass `iface.network` or `iface.ip` instead.
 
 `build()` copies the contents, so the builder stays usable and independent: later changes to
 the builder do not affect the tree. While both exist, the data is in memory twice.
